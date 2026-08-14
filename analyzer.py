@@ -1,5 +1,6 @@
 import time
 import os
+import io
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
@@ -12,7 +13,7 @@ SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "INCOLLA_QUI_LA_TUA_
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
-# 2. Server Dummy per soddisfare il Port Check di Render (GRATIS)
+# 2. Server Dummy per il Port Check di Render
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -24,6 +25,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
+
 def run_http_server():
     port = int(os.environ.get("PORT", 10000))
     server_address = ('', port)
@@ -31,6 +33,7 @@ def run_http_server():
     print(f"🌐 Server HTTP fittizio avviato sulla porta {port}")
     httpd.serve_forever()
 
+# 3. Controllo Metadati C2PA
 def check_c2pa_metadata(file_bytes: bytes) -> dict:
     """Verifica se il file contiene metadati crittografici C2PA"""
     try:
@@ -44,11 +47,56 @@ def check_c2pa_metadata(file_bytes: bytes) -> dict:
             }
     except Exception:
         pass
-        
     return {"detected": False, "claim_generator": None}
 
+# 4. Iniezione Metadati C2PA (Auto-Fix)
+def apply_c2pa_fix(file_bytes: bytes, audit_id: str) -> str:
+    """Inietta metadati C2PA di conformità e carica il file sanato su Supabase Storage"""
+    try:
+        manifest_json = """{
+            "claim_generator": "AI_Act_Shield_v1.0",
+            "title": "EU AI Act Compliant Asset",
+            "assertions": [
+                {
+                    "label": "c2pa.actions",
+                    "data": {
+                        "actions": [
+                            {
+                                "action": "c2pa.edited",
+                                "parameters": {
+                                    "description": "Metadati di trasparenza AI Act aggiunti da AI Act Shield"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }"""
+
+        input_stream = io.BytesIO(file_bytes)
+        output_stream = io.BytesIO()
+
+        # Iniezione del manifesto tramite c2pa-python
+        builder = c2pa.Builder(manifest_json)
+        builder.sign("image/jpeg", input_stream, output_stream)
+        fixed_bytes = output_stream.getvalue()
+
+        # Carica il file sanato nel bucket Supabase Storage ("audits_fixed")
+        fixed_filename = f"fixed_{audit_id}.jpg"
+        supabase.storage.from_("audits_fixed").upload(
+            file=fixed_bytes,
+            path=fixed_filename,
+            file_options={"content-type": "image/jpeg", "upsert": "true"}
+        )
+
+        fixed_url = supabase.storage.from_("audits_fixed").get_public_url(fixed_filename)
+        return fixed_url
+    except Exception as e:
+        print(f"⚠️ Errore durante l'auto-fix C2PA: {e}")
+        return None
+
+# 5. Elaborazione degli Audit in Coda
 def process_pending_audits():
-    """Recupera gli audit in sospeso da Supabase, analizza il file e aggiorna lo stato"""
     try:
         response = supabase.table("audits").select("*").eq("status", "pending").execute()
         pending_audits = response.data
@@ -79,13 +127,22 @@ def process_pending_audits():
 
             file_bytes = file_res.content
             c2pa_result = check_c2pa_metadata(file_bytes)
-            status = "compliant" if c2pa_result["detected"] else "non_compliant"
+
+            if c2pa_result["detected"]:
+                status = "compliant"
+                fixed_url = None
+            else:
+                status = "non_compliant"
+                # Esegue l'Auto-Fix automatico generativo
+                fixed_url = apply_c2pa_fix(file_bytes, audit_id)
 
             supabase.table("audits").update({
                 "status": status,
+                "fixed_file_url": fixed_url,
                 "details": {
-                    "generator": c2pa_result.get("claim_generator", "Sconosciuto"),
-                    "c2pa_info": c2pa_result
+                    "generator": c2pa_result.get("claim_generator", "AI Act Shield Auto-Fix"),
+                    "c2pa_info": c2pa_result,
+                    "recommendation": "File sanato ed equipaggiato con firma di trasparenza C2PA." if fixed_url else "File conforme."
                 }
             }).eq("id", audit_id).execute()
 
@@ -94,15 +151,12 @@ def process_pending_audits():
     except Exception as e:
         print(f"❌ Errore nell'elaborazione degli audit: {e}")
 
-# Loop di elaborazione in background
 def audit_loop():
-    print("🚀 Servizio di Analisi AI Act Shield Avviato...")
+    print("🚀 Servizio di Analisi & Auto-Fix AI Act Shield Avviato...")
     while True:
         process_pending_audits()
         time.sleep(3)
 
 if __name__ == "__main__":
-    # Avvia il loop di audit in un thread separato
     threading.Thread(target=audit_loop, daemon=True).start()
-    # Avvia il server HTTP per Render sulla porta principale
     run_http_server()

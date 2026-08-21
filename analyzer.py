@@ -142,6 +142,8 @@ def process_pending_audits():
                 continue
 
             file_bytes = file_res.content
+            mime_type = detect_mime_type(file_url, file_bytes)
+c2pa_result = check_c2pa_metadata(file_bytes, mime_type)
             c2pa_result = check_c2pa_metadata(file_bytes)
 
             if c2pa_result["detected"]:

@@ -2,6 +2,7 @@ import time
 import os
 import io
 import threading
+import mimetypes
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from supabase import create_client, Client
@@ -33,9 +34,7 @@ def run_http_server():
     print(f"🌐 Server HTTP fittizio avviato sulla porta {port}")
     httpd.serve_forever()
 
-# 3. Controllo Metadati C2PA
-import mimetypes
-
+# 3. Rilevazione Tipo MIME (Immagini, Video, Audio)
 def detect_mime_type(file_url: str, file_bytes: bytes) -> str:
     """Rileva il tipo di file (Immagine, Video o Audio)"""
     mime_type, _ = mimetypes.guess_type(file_url)
@@ -43,15 +42,15 @@ def detect_mime_type(file_url: str, file_bytes: bytes) -> str:
         # Fallback basato sui primi byte se l'estensione manca
         if file_bytes.startswith(b'\xFF\xFB') or file_bytes.startswith(b'ID3'):
             return "audio/mp3"
-        elif file_bytes[4:8] == b'ftyp':
+        elif len(file_bytes) >= 8 and file_bytes[4:8] == b'ftyp':
             return "video/mp4"
         return "image/jpeg"
     return mime_type
 
+# 4. Controllo Metadati C2PA Universale
 def check_c2pa_metadata(file_bytes: bytes, mime_type: str) -> dict:
     """Verifica metadati C2PA per Immagini, Video e Audio"""
     try:
-        # c2pa.Reader accetta direttamente il mime_type (es. 'video/mp4', 'audio/mp3')
         reader = c2pa.Reader(mime_type, file_bytes)
         manifest = reader.active_manifest()
         if manifest:
@@ -65,10 +64,12 @@ def check_c2pa_metadata(file_bytes: bytes, mime_type: str) -> dict:
         
     return {"detected": False, "claim_generator": None}
 
-# 4. Iniezione Metadati C2PA (Auto-Fix)
-def apply_c2pa_fix(file_bytes: bytes, audit_id: str) -> str:
+# 5. Iniezione Metadati C2PA (Auto-Fix)
+def apply_c2pa_fix(file_bytes: bytes, audit_id: str, mime_type: str) -> str:
     """Inietta metadati C2PA di conformità e carica il file sanato su Supabase Storage"""
     try:
+        target_mime = mime_type if ("image" in mime_type) else "image/jpeg"
+        
         manifest_json = """{
             "claim_generator": "AI_Act_Shield_v1.0",
             "title": "EU AI Act Compliant Asset",
@@ -94,15 +95,24 @@ def apply_c2pa_fix(file_bytes: bytes, audit_id: str) -> str:
 
         # Iniezione del manifesto tramite c2pa-python
         builder = c2pa.Builder(manifest_json)
-        builder.sign("image/jpeg", input_stream, output_stream)
+        builder.sign(target_mime, input_stream, output_stream)
         fixed_bytes = output_stream.getvalue()
 
+        # Determinazione estensione
+        ext = "jpg"
+        if "png" in target_mime:
+            ext = "png"
+        elif "mp4" in target_mime:
+            ext = "mp4"
+        elif "mp3" in target_mime:
+            ext = "mp3"
+
         # Carica il file sanato nel bucket Supabase Storage ("audits_fixed")
-        fixed_filename = f"fixed_{audit_id}.jpg"
+        fixed_filename = f"fixed_{audit_id}.{ext}"
         supabase.storage.from_("audits_fixed").upload(
             file=fixed_bytes,
             path=fixed_filename,
-            file_options={"content-type": "image/jpeg", "upsert": "true"}
+            file_options={"content-type": target_mime, "upsert": "true"}
         )
 
         fixed_url = supabase.storage.from_("audits_fixed").get_public_url(fixed_filename)
@@ -111,7 +121,7 @@ def apply_c2pa_fix(file_bytes: bytes, audit_id: str) -> str:
         print(f"⚠️ Errore durante l'auto-fix C2PA: {e}")
         return None
 
-# 5. Elaborazione degli Audit in Coda
+# 6. Elaborazione degli Audit in Coda
 def process_pending_audits():
     try:
         response = supabase.table("audits").select("*").eq("status", "pending").execute()
@@ -142,22 +152,24 @@ def process_pending_audits():
                 continue
 
             file_bytes = file_res.content
+
+            # --- RILEVAZIONE FORMATO ED ESECUZIONE AUDIT C2PA ---
             mime_type = detect_mime_type(file_url, file_bytes)
-c2pa_result = check_c2pa_metadata(file_bytes, mime_type)
-            c2pa_result = check_c2pa_metadata(file_bytes)
+            c2pa_result = check_c2pa_metadata(file_bytes, mime_type)
 
             if c2pa_result["detected"]:
                 status = "compliant"
                 fixed_url = None
             else:
                 status = "non_compliant"
-                # Esegue l'Auto-Fix automatico generativo
-                fixed_url = apply_c2pa_fix(file_bytes, audit_id)
+                # Esegue l'Auto-Fix automatico
+                fixed_url = apply_c2pa_fix(file_bytes, audit_id, mime_type)
 
             supabase.table("audits").update({
                 "status": status,
                 "fixed_file_url": fixed_url,
                 "details": {
+                    "mime_type": mime_type,
                     "generator": c2pa_result.get("claim_generator", "AI Act Shield Auto-Fix"),
                     "c2pa_info": c2pa_result,
                     "recommendation": "File sanato ed equipaggiato con firma di trasparenza C2PA." if fixed_url else "File conforme."

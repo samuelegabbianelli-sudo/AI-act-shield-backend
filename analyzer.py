@@ -157,22 +157,25 @@ def process_pending_audits():
             mime_type = detect_mime_type(file_url, file_bytes)
             c2pa_result = check_c2pa_metadata(file_bytes, mime_type)
 
-            if c2pa_result["detected"]:
-                status = "compliant"
-                fixed_url = None
-            else:
+            # Se NON contiene metadati C2PA -> NON CONFORME (Richiede Fix)
+            if not c2pa_result["detected"]:
                 status = "non_compliant"
-                # Esegue l'Auto-Fix automatico
+                score_generativo = 85
                 fixed_url = apply_c2pa_fix(file_bytes, audit_id, mime_type)
+            else:
+                status = "compliant"
+                score_generativo = 10
+                fixed_url = None
 
             supabase.table("audits").update({
                 "status": status,
                 "fixed_file_url": fixed_url,
                 "details": {
                     "mime_type": mime_type,
+                    "generative_score": score_generativo,
                     "generator": c2pa_result.get("claim_generator", "AI Act Shield Auto-Fix"),
                     "c2pa_info": c2pa_result,
-                    "recommendation": "File sanato ed equipaggiato con firma di trasparenza C2PA." if fixed_url else "File conforme."
+                    "recommendation": "File privo di metadati C2PA. Applicata firma di trasparenza." if fixed_url else "File conforme."
                 }
             }).eq("id", audit_id).execute()
 

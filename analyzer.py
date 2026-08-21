@@ -34,10 +34,25 @@ def run_http_server():
     httpd.serve_forever()
 
 # 3. Controllo Metadati C2PA
-def check_c2pa_metadata(file_bytes: bytes) -> dict:
-    """Verifica se il file contiene metadati crittografici C2PA"""
+import mimetypes
+
+def detect_mime_type(file_url: str, file_bytes: bytes) -> str:
+    """Rileva il tipo di file (Immagine, Video o Audio)"""
+    mime_type, _ = mimetypes.guess_type(file_url)
+    if not mime_type:
+        # Fallback basato sui primi byte se l'estensione manca
+        if file_bytes.startswith(b'\xFF\xFB') or file_bytes.startswith(b'ID3'):
+            return "audio/mp3"
+        elif file_bytes[4:8] == b'ftyp':
+            return "video/mp4"
+        return "image/jpeg"
+    return mime_type
+
+def check_c2pa_metadata(file_bytes: bytes, mime_type: str) -> dict:
+    """Verifica metadati C2PA per Immagini, Video e Audio"""
     try:
-        reader = c2pa.Reader("image/jpeg", file_bytes)
+        # c2pa.Reader accetta direttamente il mime_type (es. 'video/mp4', 'audio/mp3')
+        reader = c2pa.Reader(mime_type, file_bytes)
         manifest = reader.active_manifest()
         if manifest:
             return {
@@ -45,8 +60,9 @@ def check_c2pa_metadata(file_bytes: bytes) -> dict:
                 "claim_generator": getattr(manifest, 'claim_generator', 'C2PA Validated'),
                 "title": getattr(manifest, 'title', None)
             }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Lettura C2PA non riuscita per {mime_type}: {e}")
+        
     return {"detected": False, "claim_generator": None}
 
 # 4. Iniezione Metadati C2PA (Auto-Fix)

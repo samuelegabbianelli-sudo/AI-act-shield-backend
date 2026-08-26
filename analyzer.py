@@ -264,26 +264,30 @@ def process_pending_audits():
 
     try:
 
-        response = (
-            supabase
-            .table("audits")
-            .select("*")
-            .eq(
-                "compliance_status",
-                "pending"
-            )
-            .execute()
-        )
+       response = (
+    supabase
+    .table("audits")
+    .select("*")
+    .eq(
+        "compliance_status",
+        "pending"
+    )
+    .execute()
+)
 
-        pending_audits = response.data or []
+pending_audits = response.data or []
 
-        if not pending_audits:
+print(
+    f"[AI-ACT-SHIELD] AUDIT PENDING TROVATI: {len(pending_audits)}"
+)
 
-            print(
-                "[AI-ACT-SHIELD] Nessun audit pending."
-            )
+if not pending_audits:
 
-            return
+    print(
+        "[AI-ACT-SHIELD] Nessun audit pending."
+    )
+
+    return
 
         print(
             f"[AI-ACT-SHIELD] Trovati {len(pending_audits)} audit pending."
@@ -475,23 +479,24 @@ def process_pending_audits():
 def audit_loop():
 
     print(
-        "[AI-ACT-SHIELD] AI Act Shield real analysis worker avviato."
+        "[AI-ACT-SHIELD] WORKER LOOP ATTIVO"
     )
 
     while True:
 
-        try:
+        print(
+            "[AI-ACT-SHIELD] CICLO WORKER"
+        )
 
-            process_pending_audits()
+       try:
+    process_pending_audits()
 
-        except Exception as e:
+except Exception as e:
+    print(
+        f"[AI-ACT-SHIELD] ERROR WORKER: {e}"
+    )
 
-            print(
-                f"[AI-ACT-SHIELD] Errore generale worker: {e}"
-            )
-
-        time.sleep(5)
-
+time.sleep(5)
 
 # ============================================================
 # 9. AVVIO

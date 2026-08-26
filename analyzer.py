@@ -260,34 +260,38 @@ def update_audit(
 # 7. ELABORAZIONE AUDIT PENDING
 # ============================================================
 
+# ============================================================
+# 7. ELABORAZIONE AUDIT PENDING
+# ============================================================
+
 def process_pending_audits():
 
     try:
 
-       response = (
-    supabase
-    .table("audits")
-    .select("*")
-    .eq(
-        "compliance_status",
-        "pending"
-    )
-    .execute()
-)
+        response = (
+            supabase
+            .table("audits")
+            .select("*")
+            .eq(
+                "compliance_status",
+                "pending"
+            )
+            .execute()
+        )
 
-pending_audits = response.data or []
+        pending_audits = response.data or []
 
-print(
-    f"[AI-ACT-SHIELD] AUDIT PENDING TROVATI: {len(pending_audits)}"
-)
+        print(
+            f"[AI-ACT-SHIELD] AUDIT PENDING TROVATI: {len(pending_audits)}"
+        )
 
-if not pending_audits:
+        if not pending_audits:
 
-    print(
-        "[AI-ACT-SHIELD] Nessun audit pending."
-    )
+            print(
+                "[AI-ACT-SHIELD] Nessun audit pending."
+            )
 
-    return
+            return
 
         print(
             f"[AI-ACT-SHIELD] Trovati {len(pending_audits)} audit pending."
@@ -295,13 +299,9 @@ if not pending_audits:
 
         for audit in pending_audits:
 
-            audit_id = audit.get(
-                "id"
-            )
+            audit_id = audit.get("id")
 
-            file_url = audit.get(
-                "file_url"
-            )
+            file_url = audit.get("file_url")
 
             file_name = audit.get(
                 "file_name",
@@ -313,7 +313,7 @@ if not pending_audits:
             )
 
             # ------------------------------------------------
-            # URL mancante
+            # URL MANCANTE
             # ------------------------------------------------
 
             if not file_url:
@@ -404,7 +404,6 @@ if not pending_audits:
 
                 compliance_status = "compliant"
 
-                # Score basso = basso rischio generativo
                 ai_score = 0.10
 
                 fixed_url = None
@@ -417,11 +416,8 @@ if not pending_audits:
 
                 compliance_status = "non_compliant"
 
-                # Score alto = necessita verifica/intervento
                 ai_score = 0.85
 
-                # Il vero auto-fix C2PA verrà configurato
-                # successivamente con un signer valido.
                 fixed_url = apply_c2pa_fix(
                     file_bytes,
                     audit_id,
@@ -469,8 +465,12 @@ if not pending_audits:
                 f"[AI-ACT-SHIELD] Audit {audit_id} completato: "
                 f"{compliance_status}"
             )
+
     except Exception as e:
-        print(f"[AI-ACT-SHIELD] Errore nell'elaborazione audit: {e}")
+
+        print(
+            f"[AI-ACT-SHIELD] ERRORE ELABORAZIONE AUDIT: {e}"
+        )
 
 # ============================================================
 # 8. LOOP PRINCIPALE

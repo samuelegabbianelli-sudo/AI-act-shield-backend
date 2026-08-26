@@ -2,30 +2,46 @@ import time
 import os
 import io
 import json
+import hashlib
 import threading
 import mimetypes
+from urllib.parse import urlparse, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import requests
 from supabase import create_client, Client
 import c2pa
 
 
 # ============================================================
-# 1. CONFIGURAZIONE SUPABASE
+# 1. CONFIGURAZIONE
 # ============================================================
 
-SUPABASE_URL = "https://ulvlohhszcmdzqvipvan.supabase.co"
+SUPABASE_URL = os.environ.get(
+    "SUPABASE_URL",
+    "https://ulvlohhszcmdzqvipvan.supabase.co"
+)
 
 SUPABASE_SECRET_KEY = os.environ.get(
     "SUPABASE_SECRET_KEY",
     ""
 )
 
+MEDIA_BUCKET = os.environ.get(
+    "MEDIA_BUCKET",
+    "media-to-check"
+)
+
+WORKER_NAME = "AI Act Shield"
+
+WORKER_INTERVAL_SECONDS = int(
+    os.environ.get("WORKER_INTERVAL_SECONDS", "5")
+)
+
 if not SUPABASE_SECRET_KEY:
     raise RuntimeError(
         "SUPABASE_SECRET_KEY non configurata nelle Environment Variables di Render."
     )
+
 
 supabase: Client = create_client(
     SUPABASE_URL,
@@ -43,6 +59,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
+
         self.wfile.write(
             b"AI Act Shield Worker is Running!"
         )
@@ -71,14 +88,123 @@ def run_http_server():
     )
 
     print(
-        f"[AI-ACT-SHIELD] HTTP server avviato sulla porta {port}."
+        f"[AI-ACT-SHIELD] HTTP server avviato sulla porta {port}.",
+        flush=True
     )
 
     httpd.serve_forever()
 
 
 # ============================================================
-# 3. RILEVAZIONE MIME TYPE
+# 3. NORMALIZZAZIONE PATH STORAGE
+# ============================================================
+
+def normalize_storage_path(file_url: str) -> str:
+    """
+    Il frontend salva normalmente file_url come:
+
+        <user_id>/<filename>
+
+    Non è una URL HTTP.
+
+    Questa funzione accetta anche una eventuale URL Supabase
+    completa, così il worker rimane compatibile con eventuali
+    vecchi record.
+    """
+
+    if not file_url:
+        raise ValueError("file_url vuoto")
+
+    value = str(file_url).strip()
+
+    # Caso normale:
+    # user-id/nome-file.jpg
+    if not value.startswith(("http://", "https://")):
+        return unquote(value.lstrip("/"))
+
+    # Compatibilità con eventuali URL Storage complete.
+    parsed = urlparse(value)
+
+    path = unquote(
+        parsed.path.lstrip("/")
+    )
+
+    markers = [
+        f"storage/v1/object/public/{MEDIA_BUCKET}/",
+        f"storage/v1/object/sign/{MEDIA_BUCKET}/",
+        f"storage/v1/object/authenticated/{MEDIA_BUCKET}/",
+    ]
+
+    for marker in markers:
+
+        if marker in path:
+
+            return path.split(
+                marker,
+                1
+            )[1]
+
+    # Se non riconosciamo il formato, non tentiamo
+    # una richiesta HTTP: meglio fallire chiaramente.
+    raise ValueError(
+        f"URL Storage non riconosciuta: {file_url}"
+    )
+
+
+# ============================================================
+# 4. DOWNLOAD DA SUPABASE STORAGE
+# ============================================================
+
+def download_file_from_storage(
+    file_url: str
+) -> bytes:
+
+    storage_path = normalize_storage_path(
+        file_url
+    )
+
+    print(
+        f"[DOWNLOAD] Bucket: {MEDIA_BUCKET}",
+        flush=True
+    )
+
+    print(
+        f"[DOWNLOAD] Path: {storage_path}",
+        flush=True
+    )
+
+    try:
+
+        file_bytes = (
+            supabase
+            .storage
+            .from_(MEDIA_BUCKET)
+            .download(storage_path)
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            f"Download Supabase Storage fallito "
+            f"(bucket={MEDIA_BUCKET}, path={storage_path}): {e}"
+        ) from e
+
+    if not file_bytes:
+
+        raise RuntimeError(
+            "Supabase Storage ha restituito un file vuoto."
+        )
+
+    print(
+        f"[DOWNLOAD] OK - {len(file_bytes)} bytes",
+        flush=True
+    )
+
+    return file_bytes
+
+
+# ============================================================
+# 5. RILEVAZIONE MIME TYPE
 # ============================================================
 
 def detect_mime_type(
@@ -98,23 +224,17 @@ def detect_mime_type(
         return "image/jpeg"
 
     # PNG
-    if file_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+    if file_bytes.startswith(
+        b"\x89PNG\r\n\x1a\n"
+    ):
         return "image/png"
 
     # GIF
-    if file_bytes.startswith(b"GIF87a") or file_bytes.startswith(b"GIF89a"):
-        return "image/gif"
-
-    # MP3
     if (
-        file_bytes.startswith(b"\xff\xfb")
-        or file_bytes.startswith(b"ID3")
+        file_bytes.startswith(b"GIF87a")
+        or file_bytes.startswith(b"GIF89a")
     ):
-        return "audio/mpeg"
-
-    # MP4 / ISO Base Media
-    if len(file_bytes) >= 12 and file_bytes[4:8] == b"ftyp":
-        return "video/mp4"
+        return "image/gif"
 
     # WebP
     if (
@@ -124,12 +244,42 @@ def detect_mime_type(
     ):
         return "image/webp"
 
-    # Fallback
+    # PDF
+    if file_bytes.startswith(b"%PDF-"):
+        return "application/pdf"
+
+    # MP3
+    if (
+        file_bytes.startswith(b"\xff\xfb")
+        or file_bytes.startswith(b"ID3")
+    ):
+        return "audio/mpeg"
+
+    # MP4 / ISO Base Media
+    if (
+        len(file_bytes) >= 12
+        and file_bytes[4:8] == b"ftyp"
+    ):
+        return "video/mp4"
+
     return "application/octet-stream"
 
 
 # ============================================================
-# 4. CONTROLLO C2PA
+# 6. HASH SHA-256
+# ============================================================
+
+def calculate_sha256(
+    file_bytes: bytes
+) -> str:
+
+    return hashlib.sha256(
+        file_bytes
+    ).hexdigest()
+
+
+# ============================================================
+# 7. CONTROLLO C2PA
 # ============================================================
 
 def check_c2pa_metadata(
@@ -162,6 +312,7 @@ def check_c2pa_metadata(
         )
 
         if not active_label:
+
             return {
                 "detected": False,
                 "claim_generator": None,
@@ -173,6 +324,7 @@ def check_c2pa_metadata(
         )
 
         if not manifest:
+
             return {
                 "detected": False,
                 "claim_generator": None,
@@ -186,13 +338,16 @@ def check_c2pa_metadata(
             ),
             "title": manifest.get(
                 "title"
-            )
+            ),
+            "active_manifest": active_label
         }
 
     except Exception as e:
 
         print(
-            f"[C2PA] Nessun manifest valido rilevato per {mime_type}: {e}"
+            f"[C2PA] Nessun manifest valido "
+            f"rilevato per {mime_type}: {e}",
+            flush=True
         )
 
         return {
@@ -204,16 +359,58 @@ def check_c2pa_metadata(
 
 
 # ============================================================
-# 5. AUTO-FIX C2PA
+# 8. WATERMARK
 # ============================================================
 #
-# IMPORTANTE:
-# Una vera firma C2PA richiede un signer/certificato.
-# Non inseriamo una "finta" firma nel file.
+# NON inventiamo un risultato.
 #
-# Per ora questa funzione restituisce None.
-# La implementeremo dopo aver configurato il certificato
-# C2PA corretto.
+# Il rilevatore watermark reale non è ancora collegato
+# al worker. Restituiamo quindi uno stato esplicito.
+# ============================================================
+
+def check_watermark(
+    file_bytes: bytes,
+    mime_type: str
+) -> dict:
+
+    return {
+        "detected": None,
+        "status": "not_implemented",
+        "detail": (
+            "Watermark detection non ancora "
+            "collegato al motore reale."
+        )
+    }
+
+
+# ============================================================
+# 9. AI DETECTION
+# ============================================================
+#
+# NON restituiamo uno score casuale.
+#
+# Il modello AI detection reale dovrà essere collegato
+# successivamente.
+# ============================================================
+
+def run_ai_detection(
+    file_bytes: bytes,
+    mime_type: str
+) -> dict:
+
+    return {
+        "available": False,
+        "score": None,
+        "status": "not_implemented",
+        "detail": (
+            "AI detection model non ancora "
+            "collegato al worker."
+        )
+    }
+
+
+# ============================================================
+# 10. AUTO-FIX C2PA
 # ============================================================
 
 def apply_c2pa_fix(
@@ -223,45 +420,430 @@ def apply_c2pa_fix(
 ):
 
     print(
-        f"[C2PA] Auto-fix non ancora configurato per audit {audit_id}."
+        f"[C2PA] Auto-fix non configurato "
+        f"per audit {audit_id}.",
+        flush=True
     )
 
+    # Non generiamo una falsa firma C2PA.
     return None
 
 
 # ============================================================
-# 6. AGGIORNAMENTO AUDIT
+# 11. AGGIORNAMENTO AUDIT
 # ============================================================
 
 def update_audit(
     audit_id,
     data
-):
+) -> bool:
 
     try:
 
-        supabase.table(
-            "audits"
-        ).update(
-            data
-        ).eq(
-            "id",
-            audit_id
-        ).execute()
+        response = (
+            supabase
+            .table("audits")
+            .update(data)
+            .eq("id", audit_id)
+            .execute()
+        )
+
+        updated_rows = response.data or []
+
+        if not updated_rows:
+
+            print(
+                f"[DATABASE] ATTENZIONE: audit {audit_id} "
+                f"non aggiornato.",
+                flush=True
+            )
+
+            return False
+
+        print(
+            f"[DATABASE] Audit {audit_id} aggiornato.",
+            flush=True
+        )
+
+        return True
 
     except Exception as e:
 
         print(
-            f"[SUPABASE] Errore aggiornamento audit {audit_id}: {e}"
+            f"[DATABASE] Errore aggiornamento "
+            f"audit {audit_id}: {e}",
+            flush=True
         )
 
+        return False
+
 
 # ============================================================
-# 7. ELABORAZIONE AUDIT PENDING
+# 12. GESTIONE ERRORE AUDIT
 # ============================================================
 
+def mark_audit_error(
+    audit_id: str,
+    error_message: str,
+    extra_details: dict | None = None
+):
+
+    details = {
+        "worker": WORKER_NAME,
+        "error": error_message
+    }
+
+    if extra_details:
+        details.update(
+            extra_details
+        )
+
+    # Manteniamo lo schema attuale:
+    # pending / compliant / non_compliant
+    #
+    # Non introduciamo uno stato "error" che potrebbe
+    # non essere previsto dal database.
+    update_audit(
+        audit_id,
+        {
+            "compliance_status": "non_compliant",
+            "details": details
+        }
+    )
+
+
 # ============================================================
-# 7. ELABORAZIONE AUDIT PENDING
+# 13. ELABORAZIONE SINGOLO AUDIT
+# ============================================================
+
+def process_single_audit(
+    audit: dict
+):
+
+    audit_id = audit.get(
+        "id"
+    )
+
+    file_url = audit.get(
+        "file_url"
+    )
+
+    file_name = audit.get(
+        "file_name",
+        "unknown"
+    )
+
+    print(
+        "",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    print(
+        f"[WORKER] Audit pending: {audit_id}",
+        flush=True
+    )
+
+    print(
+        f"[WORKER] File: {file_name}",
+        flush=True
+    )
+
+    print(
+        f"[WORKER] Storage path: {file_url}",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+    if not audit_id:
+
+        print(
+            "[WORKER] Audit senza ID. Ignorato.",
+            flush=True
+        )
+
+        return
+
+    if not file_url:
+
+        print(
+            f"[WORKER] Audit {audit_id}: "
+            f"file_url mancante.",
+            flush=True
+        )
+
+        mark_audit_error(
+            audit_id,
+            "file_url mancante"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DOWNLOAD
+    # --------------------------------------------------------
+
+    try:
+
+        file_bytes = download_file_from_storage(
+            file_url
+        )
+
+    except Exception as e:
+
+        print(
+            f"[DOWNLOAD] ERRORE audit {audit_id}: {e}",
+            flush=True
+        )
+
+        mark_audit_error(
+            audit_id,
+            "Impossibile scaricare il file da Supabase Storage",
+            {
+                "reason": str(e),
+                "file_url": file_url,
+                "bucket": MEDIA_BUCKET
+            }
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MIME
+    # --------------------------------------------------------
+
+    mime_type = detect_mime_type(
+        file_url,
+        file_bytes
+    )
+
+    print(
+        f"[ANALYSIS] MIME: {mime_type}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # HASH
+    # --------------------------------------------------------
+
+    file_hash = calculate_sha256(
+        file_bytes
+    )
+
+    print(
+        f"[ANALYSIS] SHA-256: {file_hash}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # C2PA
+    # --------------------------------------------------------
+
+    print(
+        f"[ANALYSIS] C2PA: starting",
+        flush=True
+    )
+
+    c2pa_result = check_c2pa_metadata(
+        file_bytes,
+        mime_type
+    )
+
+    c2pa_detected = bool(
+        c2pa_result.get(
+            "detected"
+        )
+    )
+
+    print(
+        f"[ANALYSIS] C2PA detected: "
+        f"{c2pa_detected}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # WATERMARK
+    # --------------------------------------------------------
+
+    print(
+        f"[ANALYSIS] Watermark: starting",
+        flush=True
+    )
+
+    watermark_result = check_watermark(
+        file_bytes,
+        mime_type
+    )
+
+    watermark_detected = watermark_result.get(
+        "detected"
+    )
+
+    print(
+        f"[ANALYSIS] Watermark detected: "
+        f"{watermark_detected}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # AI DETECTION
+    # --------------------------------------------------------
+
+    print(
+        f"[ANALYSIS] AI detection: starting",
+        flush=True
+    )
+
+    ai_result = run_ai_detection(
+        file_bytes,
+        mime_type
+    )
+
+    ai_score = ai_result.get(
+        "score"
+    )
+
+    print(
+        f"[ANALYSIS] AI score: {ai_score}",
+        flush=True
+    )
+
+    # --------------------------------------------------------
+    # C2PA AUTO-FIX
+    # --------------------------------------------------------
+
+    fixed_url = None
+
+    if not c2pa_detected:
+
+        fixed_url = apply_c2pa_fix(
+            file_bytes,
+            audit_id,
+            mime_type
+        )
+
+    # --------------------------------------------------------
+    # VALUTAZIONE
+    # --------------------------------------------------------
+    #
+    # IMPORTANTE:
+    #
+    # Non consideriamo automaticamente "AI generated"
+    # un file solo perché manca C2PA.
+    #
+    # L'assenza di C2PA significa semplicemente che
+    # non abbiamo trovato un manifest C2PA.
+    #
+    # Per ora:
+    #
+    # C2PA presente -> compliant
+    # C2PA assente  -> non_compliant
+    #
+    # Questa regola può essere raffinata successivamente
+    # in base ai requisiti reali del prodotto.
+    # --------------------------------------------------------
+
+    if c2pa_detected:
+
+        compliance_status = "compliant"
+
+        recommendation = (
+            "Manifest C2PA rilevato."
+        )
+
+    else:
+
+        compliance_status = "non_compliant"
+
+        recommendation = (
+            "Nessun manifest C2PA rilevato. "
+            "Il file richiede verifica/remediation."
+        )
+
+    # --------------------------------------------------------
+    # DETTAGLI
+    # --------------------------------------------------------
+
+    details = {
+        "worker": WORKER_NAME,
+        "file_name": file_name,
+        "storage_bucket": MEDIA_BUCKET,
+        "storage_path": file_url,
+        "mime_type": mime_type,
+        "file_size": len(file_bytes),
+        "sha256": file_hash,
+
+        "c2pa": c2pa_result,
+
+        "watermark": watermark_result,
+
+        "ai_detection": ai_result,
+
+        "recommendation": recommendation
+    }
+
+    # --------------------------------------------------------
+    # DATABASE UPDATE
+    # --------------------------------------------------------
+
+    print(
+        f"[DATABASE] Updating audit {audit_id}",
+        flush=True
+    )
+
+    update_data = {
+        "compliance_status": compliance_status,
+
+        "c2pa_detected": c2pa_detected,
+
+        "watermark_detected": watermark_detected,
+
+        "ai_score": ai_score,
+
+        "file_hash": file_hash,
+
+        "fixed_file_url": fixed_url,
+
+        "details": details
+    }
+
+    success = update_audit(
+        audit_id,
+        update_data
+    )
+
+    if not success:
+
+        print(
+            f"[DATABASE] ERRORE: impossibile completare "
+            f"update audit {audit_id}",
+            flush=True
+        )
+
+        return
+
+    print(
+        f"[DATABASE] Audit {audit_id} completed: "
+        f"{compliance_status}",
+        flush=True
+    )
+
+    print(
+        "============================================================",
+        flush=True
+    )
+
+
+# ============================================================
+# 14. ELABORAZIONE AUDIT PENDING
 # ============================================================
 
 def process_pending_audits():
@@ -276,220 +858,104 @@ def process_pending_audits():
                 "compliance_status",
                 "pending"
             )
+            .order(
+                "created_at",
+                desc=False
+            )
             .execute()
         )
 
         pending_audits = response.data or []
 
         print(
-            f"[AI-ACT-SHIELD] AUDIT PENDING TROVATI: {len(pending_audits)}"
+            f"[AI-ACT-SHIELD] "
+            f"AUDIT PENDING TROVATI: "
+            f"{len(pending_audits)}",
+            flush=True
         )
 
         if not pending_audits:
 
             print(
-                "[AI-ACT-SHIELD] Nessun audit pending."
+                "[AI-ACT-SHIELD] Nessun audit pending.",
+                flush=True
             )
 
             return
 
         print(
-            f"[AI-ACT-SHIELD] Trovati {len(pending_audits)} audit pending."
+            f"[AI-ACT-SHIELD] "
+            f"Trovati {len(pending_audits)} audit pending.",
+            flush=True
         )
 
         for audit in pending_audits:
 
-            audit_id = audit.get("id")
-
-            file_url = audit.get("file_url")
-
-            file_name = audit.get(
-                "file_name",
-                "unknown"
-            )
-
-            print(
-                f"[AI-ACT-SHIELD] Analisi audit {audit_id} - {file_name}"
-            )
-
-            # ------------------------------------------------
-            # URL MANCANTE
-            # ------------------------------------------------
-
-            if not file_url:
-
-                print(
-                    f"[AI-ACT-SHIELD] Audit {audit_id}: file_url mancante."
-                )
-
-                update_audit(
-                    audit_id,
-                    {
-                        "compliance_status": "non_compliant",
-                        "details": {
-                            "error": "URL file mancante",
-                            "worker": "AI Act Shield"
-                        }
-                    }
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # DOWNLOAD FILE
-            # ------------------------------------------------
-
             try:
 
-                file_res = requests.get(
-                    file_url,
-                    timeout=30
+                process_single_audit(
+                    audit
                 )
-
-                file_res.raise_for_status()
-
-                file_bytes = file_res.content
 
             except Exception as e:
 
+                audit_id = audit.get(
+                    "id"
+                )
+
                 print(
-                    f"[DOWNLOAD] Errore audit {audit_id}: {e}"
+                    f"[WORKER] Errore non gestito "
+                    f"nell'audit {audit_id}: {e}",
+                    flush=True
                 )
 
-                update_audit(
-                    audit_id,
-                    {
-                        "compliance_status": "non_compliant",
-                        "details": {
-                            "error": "Impossibile scaricare il file",
-                            "reason": str(e),
-                            "worker": "AI Act Shield"
+                if audit_id:
+
+                    mark_audit_error(
+                        audit_id,
+                        "Errore interno durante l'elaborazione",
+                        {
+                            "reason": str(e)
                         }
-                    }
-                )
-
-                continue
-
-            # ------------------------------------------------
-            # MIME TYPE
-            # ------------------------------------------------
-
-            mime_type = detect_mime_type(
-                file_url,
-                file_bytes
-            )
-
-            print(
-                f"[AI-ACT-SHIELD] MIME rilevato: {mime_type}"
-            )
-
-            # ------------------------------------------------
-            # CONTROLLO C2PA
-            # ------------------------------------------------
-
-            c2pa_result = check_c2pa_metadata(
-                file_bytes,
-                mime_type
-            )
-
-            c2pa_detected = bool(
-                c2pa_result.get("detected")
-            )
-
-            # ------------------------------------------------
-            # VALUTAZIONE
-            # ------------------------------------------------
-
-            if c2pa_detected:
-
-                compliance_status = "compliant"
-
-                ai_score = 0.10
-
-                fixed_url = None
-
-                recommendation = (
-                    "File con manifest C2PA rilevato."
-                )
-
-            else:
-
-                compliance_status = "non_compliant"
-
-                ai_score = 0.85
-
-                fixed_url = apply_c2pa_fix(
-                    file_bytes,
-                    audit_id,
-                    mime_type
-                )
-
-                if fixed_url:
-
-                    recommendation = (
-                        "File privo di C2PA. "
-                        "Applicata firma C2PA."
                     )
-
-                else:
-
-                    recommendation = (
-                        "File privo di manifest C2PA. "
-                        "Auto-fix C2PA non ancora configurato."
-                    )
-
-            # ------------------------------------------------
-            # SALVATAGGIO RISULTATO
-            # ------------------------------------------------
-
-            details = {
-                "worker": "AI Act Shield",
-                "mime_type": mime_type,
-                "ai_score": ai_score,
-                "c2pa_info": c2pa_result,
-                "recommendation": recommendation
-            }
-
-            update_audit(
-                audit_id,
-                {
-                    "compliance_status": compliance_status,
-                    "c2pa_detected": c2pa_detected,
-                    "ai_score": ai_score,
-                    "fixed_file_url": fixed_url,
-                    "details": details
-                }
-            )
-
-            print(
-                f"[AI-ACT-SHIELD] Audit {audit_id} completato: "
-                f"{compliance_status}"
-            )
 
     except Exception as e:
 
         print(
-            f"[AI-ACT-SHIELD] ERRORE ELABORAZIONE AUDIT: {e}"
+            f"[AI-ACT-SHIELD] "
+            f"ERRORE ELABORAZIONE AUDIT: {e}",
+            flush=True
         )
 
-# ============================================================
-# 8. LOOP PRINCIPALE
-# ============================================================
 
 # ============================================================
-# 8. LOOP PRINCIPALE
+# 15. LOOP PRINCIPALE
 # ============================================================
 
 def audit_loop():
 
     print(
-        "[AI-ACT-SHIELD] WORKER LOOP ATTIVO"
+        "[AI-ACT-SHIELD] WORKER LOOP ATTIVO",
+        flush=True
+    )
+
+    print(
+        f"[AI-ACT-SHIELD] "
+        f"Intervallo: {WORKER_INTERVAL_SECONDS}s",
+        flush=True
+    )
+
+    print(
+        f"[AI-ACT-SHIELD] "
+        f"Bucket Storage: {MEDIA_BUCKET}",
+        flush=True
     )
 
     while True:
 
         print(
-            "[AI-ACT-SHIELD] CICLO WORKER"
+            "[AI-ACT-SHIELD] CICLO WORKER",
+            flush=True
         )
 
         try:
@@ -499,16 +965,26 @@ def audit_loop():
         except Exception as e:
 
             print(
-                f"[AI-ACT-SHIELD] ERRORE WORKER: {e}"
+                f"[AI-ACT-SHIELD] "
+                f"ERRORE WORKER: {e}",
+                flush=True
             )
 
-        time.sleep(5)
+        time.sleep(
+            WORKER_INTERVAL_SECONDS
+        )
+
 
 # ============================================================
-# 9. AVVIO
+# 16. AVVIO
 # ============================================================
 
 if __name__ == "__main__":
+
+    print(
+        "[AI-ACT-SHIELD] Avvio worker...",
+        flush=True
+    )
 
     threading.Thread(
         target=audit_loop,

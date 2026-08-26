@@ -476,6 +476,10 @@ def process_pending_audits():
 # 8. LOOP PRINCIPALE
 # ============================================================
 
+# ============================================================
+# 8. LOOP PRINCIPALE
+# ============================================================
+
 def audit_loop():
 
     print(
@@ -488,15 +492,17 @@ def audit_loop():
             "[AI-ACT-SHIELD] CICLO WORKER"
         )
 
-       try:
-    process_pending_audits()
+        try:
 
-except Exception as e:
-    print(
-        f"[AI-ACT-SHIELD] ERROR WORKER: {e}"
-    )
+            process_pending_audits()
 
-time.sleep(5)
+        except Exception as e:
+
+            print(
+                f"[AI-ACT-SHIELD] ERRORE WORKER: {e}"
+            )
+
+        time.sleep(5)
 
 # ============================================================
 # 9. AVVIO

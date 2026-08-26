@@ -465,7 +465,8 @@ def process_pending_audits():
                 f"[AI-ACT-SHIELD] Audit {audit_id} completato: "
                 f"{compliance_status}"
             )
-
+    except Exception as e:
+        print(f"[AI-ACT-SHIELD] Errore nell'elaborazione audit: {e}")
 
 # ============================================================
 # 8. LOOP PRINCIPALE

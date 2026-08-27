@@ -5,6 +5,8 @@ import json
 import hashlib
 import threading
 import mimetypes
+import struct
+
 from urllib.parse import urlparse, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -14,35 +16,34 @@ import c2pa
 
 # ============================================================
 # AI ACT SHIELD
-# ANALYZER WORKER
+# ANALYZER ENGINE
 #
 # Pipeline:
 #
-# Supabase Storage
+# Supabase audits
 #       ↓
 # media-to-check
 #       ↓
-# download
+# Analyzer
+#       ├── File engine
+#       ├── SHA-256
+#       ├── C2PA engine
+#       ├── Metadata engine
+#       ├── Watermark engine
+#       ├── AI detection engine
+#       ├── Evidence engine
+#       └── Risk engine
 #       ↓
-# MIME detection
-#       ↓
-# SHA-256
-#       ↓
-# C2PA verification
-#       ↓
-# Watermark engine
-#       ↓
-# AI detection engine
-#       ↓
-# Evidence / compliance engine
-#       ↓
-# audits
+# Supabase audits
 #       ↓
 # Fixer AI-act shield
 #
-# I motori Watermark e AI Detection sono modulari:
-# possono essere sostituiti successivamente senza
-# modificare la pipeline principale.
+# IMPORTANT:
+# - Nessuno score AI viene inventato.
+# - Nessuna firma C2PA falsa viene generata.
+# - "compliant" indica conformità tecnica rispetto
+#   alle regole attualmente implementate, NON certificazione
+#   legale definitiva di conformità all'AI Act.
 # ============================================================
 
 
@@ -60,13 +61,11 @@ SUPABASE_SECRET_KEY = os.environ.get(
     ""
 )
 
-# Bucket originale dove il frontend carica i file.
 MEDIA_BUCKET = os.environ.get(
     "MEDIA_BUCKET",
     "media-to-check"
 )
 
-# Bucket destinazione per eventuali file modificati/corretti.
 FIXER_BUCKET = os.environ.get(
     "FIXER_BUCKET",
     "Fixer AI-act shield"
@@ -81,12 +80,10 @@ WORKER_INTERVAL_SECONDS = int(
     )
 )
 
-# Limite sicurezza per il download.
-# Default: 100 MB.
 MAX_FILE_SIZE_MB = int(
     os.environ.get(
         "MAX_FILE_SIZE_MB",
-        "100"
+        "50"
     )
 )
 
@@ -110,7 +107,19 @@ supabase: Client = create_client(
 
 
 # ============================================================
-# 2. SERVER HTTP PER RENDER
+# 2. LOGGING
+# ============================================================
+
+def log(message: str):
+
+    print(
+        f"[AI-ACT-SHIELD] {message}",
+        flush=True
+    )
+
+
+# ============================================================
+# 3. SERVER HTTP PER RENDER
 # ============================================================
 
 class SimpleHTTPRequestHandler(
@@ -129,15 +138,19 @@ class SimpleHTTPRequestHandler(
         self.end_headers()
 
         response = {
-            "status": "ok",
             "service": WORKER_NAME,
-            "worker": "running"
+            "status": "running",
+            "worker_interval_seconds": (
+                WORKER_INTERVAL_SECONDS
+            ),
+            "media_bucket": MEDIA_BUCKET,
+            "fixer_bucket": FIXER_BUCKET
         }
 
         self.wfile.write(
-            json.dumps(
-                response
-            ).encode("utf-8")
+            json.dumps(response).encode(
+                "utf-8"
+            )
         )
 
     def do_HEAD(self):
@@ -156,6 +169,7 @@ class SimpleHTTPRequestHandler(
         format,
         *args
     ):
+
         return
 
 
@@ -178,33 +192,26 @@ def run_http_server():
         SimpleHTTPRequestHandler
     )
 
-    print(
-        f"[HTTP] Server avviato sulla porta {port}.",
-        flush=True
+    log(
+        f"HTTP server avviato sulla porta {port}."
     )
 
     httpd.serve_forever()
 
 
 # ============================================================
-# 3. NORMALIZZAZIONE STORAGE PATH
+# 4. NORMALIZZAZIONE STORAGE PATH
 # ============================================================
 
 def normalize_storage_path(
     file_url: str
 ) -> str:
     """
-    Accetta:
+    Supporta:
 
-        user_id/file.png
+        user-id/file.png
 
-    oppure URL Supabase Storage come:
-
-        https://.../storage/v1/object/public/media-to-check/...
-
-    Restituisce sempre:
-
-        user_id/file.png
+    oppure URL Supabase Storage complete.
     """
 
     if not file_url:
@@ -220,7 +227,7 @@ def normalize_storage_path(
     # --------------------------------------------------------
     # Caso normale:
     #
-    # user-id/file-name.jpg
+    # user-id/file.png
     # --------------------------------------------------------
 
     if not value.startswith(
@@ -235,7 +242,7 @@ def normalize_storage_path(
         )
 
     # --------------------------------------------------------
-    # Caso URL Supabase Storage
+    # URL Supabase Storage
     # --------------------------------------------------------
 
     parsed = urlparse(
@@ -247,25 +254,31 @@ def normalize_storage_path(
     )
 
     markers = [
-
-        f"storage/v1/object/public/{MEDIA_BUCKET}/",
-
-        f"storage/v1/object/sign/{MEDIA_BUCKET}/",
-
-        f"storage/v1/object/authenticated/{MEDIA_BUCKET}/"
-
+        (
+            "storage/v1/object/public/"
+            + MEDIA_BUCKET
+            + "/"
+        ),
+        (
+            "storage/v1/object/sign/"
+            + MEDIA_BUCKET
+            + "/"
+        ),
+        (
+            "storage/v1/object/authenticated/"
+            + MEDIA_BUCKET
+            + "/"
+        )
     ]
 
     for marker in markers:
 
         if marker in path:
 
-            storage_path = path.split(
+            return path.split(
                 marker,
                 1
             )[1]
-
-            return storage_path
 
     raise ValueError(
         f"URL Storage non riconosciuta: {file_url}"
@@ -273,7 +286,7 @@ def normalize_storage_path(
 
 
 # ============================================================
-# 4. DOWNLOAD SUPABASE STORAGE
+# 5. DOWNLOAD FILE
 # ============================================================
 
 def download_file_from_storage(
@@ -284,14 +297,12 @@ def download_file_from_storage(
         file_url
     )
 
-    print(
-        f"[DOWNLOAD] Bucket: {MEDIA_BUCKET}",
-        flush=True
+    log(
+        f"Download bucket={MEDIA_BUCKET}"
     )
 
-    print(
-        f"[DOWNLOAD] Path: {storage_path}",
-        flush=True
+    log(
+        f"Download path={storage_path}"
     )
 
     try:
@@ -300,52 +311,45 @@ def download_file_from_storage(
             supabase
             .storage
             .from_(MEDIA_BUCKET)
-            .download(
-                storage_path
-            )
+            .download(storage_path)
         )
 
     except Exception as e:
 
         raise RuntimeError(
-            "Download Supabase Storage fallito "
-            f"(bucket={MEDIA_BUCKET}, "
-            f"path={storage_path}): {e}"
+            "Download Supabase Storage fallito: "
+            f"{e}"
         ) from e
 
-    if file_bytes is None:
-
-        raise RuntimeError(
-            "Supabase Storage ha restituito None."
-        )
-
-    if len(file_bytes) == 0:
+    if not file_bytes:
 
         raise RuntimeError(
             "Supabase Storage ha restituito "
             "un file vuoto."
         )
 
-    if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+    file_size = len(
+        file_bytes
+    )
+
+    log(
+        f"Download completato: {file_size} bytes"
+    )
+
+    if file_size > MAX_FILE_SIZE_BYTES:
 
         raise RuntimeError(
             f"File troppo grande: "
-            f"{len(file_bytes)} bytes. "
-            f"Limite configurato: "
+            f"{file_size} bytes. "
+            f"Limite: "
             f"{MAX_FILE_SIZE_MB} MB."
         )
-
-    print(
-        f"[DOWNLOAD] OK - "
-        f"{len(file_bytes)} bytes",
-        flush=True
-    )
 
     return file_bytes
 
 
 # ============================================================
-# 5. MIME TYPE
+# 6. MIME TYPE
 # ============================================================
 
 def detect_mime_type(
@@ -353,42 +357,29 @@ def detect_mime_type(
     file_bytes: bytes
 ) -> str:
 
-    # --------------------------------------------------------
-    # Prima prova dal nome/path.
-    # --------------------------------------------------------
-
     mime_type, _ = mimetypes.guess_type(
         file_url
     )
 
     if mime_type:
 
-        return mime_type.lower()
+        return mime_type
 
-    # --------------------------------------------------------
     # JPEG
-    # --------------------------------------------------------
-
     if file_bytes.startswith(
         b"\xff\xd8\xff"
     ):
 
         return "image/jpeg"
 
-    # --------------------------------------------------------
     # PNG
-    # --------------------------------------------------------
-
     if file_bytes.startswith(
         b"\x89PNG\r\n\x1a\n"
     ):
 
         return "image/png"
 
-    # --------------------------------------------------------
     # GIF
-    # --------------------------------------------------------
-
     if (
         file_bytes.startswith(b"GIF87a")
         or
@@ -397,105 +388,75 @@ def detect_mime_type(
 
         return "image/gif"
 
-    # --------------------------------------------------------
     # WEBP
-    # --------------------------------------------------------
-
     if (
         file_bytes.startswith(b"RIFF")
-        and
-        len(file_bytes) >= 12
-        and
-        file_bytes[8:12] == b"WEBP"
+        and len(file_bytes) >= 12
+        and file_bytes[8:12] == b"WEBP"
     ):
 
         return "image/webp"
 
-    # --------------------------------------------------------
     # PDF
-    # --------------------------------------------------------
-
     if file_bytes.startswith(
         b"%PDF-"
     ):
 
         return "application/pdf"
 
-    # --------------------------------------------------------
     # MP3
-    # --------------------------------------------------------
-
     if (
-        file_bytes.startswith(b"\xff\xfb")
-        or
         file_bytes.startswith(b"ID3")
+        or
+        file_bytes.startswith(b"\xff\xfb")
     ):
 
         return "audio/mpeg"
 
-    # --------------------------------------------------------
-    # MP4 / ISO Base Media
-    # --------------------------------------------------------
-
+    # MP4 / ISO BMFF
     if (
         len(file_bytes) >= 12
-        and
-        file_bytes[4:8] == b"ftyp"
+        and file_bytes[4:8] == b"ftyp"
     ):
 
         return "video/mp4"
-
-    # --------------------------------------------------------
-    # Fallback
-    # --------------------------------------------------------
 
     return "application/octet-stream"
 
 
 # ============================================================
-# 6. CLASSIFICAZIONE MEDIA
+# 7. FILE ENGINE
 # ============================================================
 
-def classify_media_type(
+def analyze_file(
+    file_bytes: bytes,
+    file_url: str,
+    file_name: str,
     mime_type: str
-) -> str:
+) -> dict:
 
-    if mime_type.startswith(
-        "image/"
-    ):
+    extension = ""
 
-        return "image"
+    if "." in file_name:
 
-    if mime_type.startswith(
-        "video/"
-    ):
+        extension = (
+            file_name
+            .rsplit(".", 1)[1]
+            .lower()
+        )
 
-        return "video"
-
-    if mime_type.startswith(
-        "audio/"
-    ):
-
-        return "audio"
-
-    if mime_type == "application/pdf":
-
-        return "document"
-
-    return "unknown"
-
-
-# ============================================================
-# 7. SHA-256
-# ============================================================
-
-def calculate_sha256(
-    file_bytes: bytes
-) -> str:
-
-    return hashlib.sha256(
+    sha256 = hashlib.sha256(
         file_bytes
     ).hexdigest()
+
+    return {
+        "file_name": file_name,
+        "mime_type": mime_type,
+        "extension": extension,
+        "size_bytes": len(file_bytes),
+        "sha256": sha256,
+        "storage_path": file_url
+    }
 
 
 # ============================================================
@@ -506,26 +467,16 @@ def check_c2pa_metadata(
     file_bytes: bytes,
     mime_type: str
 ) -> dict:
-    """
-    Verifica la presenza di un manifest C2PA.
-
-    IMPORTANTE:
-    la semplice presenza di metadati non viene
-    trasformata automaticamente in una "firma valida".
-
-    Restituisce uno stato strutturato che in futuro
-    potremo arricchire con la verifica completa
-    delle firme e delle assertions.
-    """
 
     result = {
-        "available": True,
         "detected": False,
-        "verified": False,
-        "status": "not_found",
+        "status": "not_detected",
         "claim_generator": None,
         "title": None,
-        "active_manifest": None
+        "active_manifest": None,
+        "manifest_count": 0,
+        "manifests": {},
+        "error": None
     }
 
     try:
@@ -545,224 +496,922 @@ def check_c2pa_metadata(
             raw_json
         )
 
-        active_label = manifest_store.get(
-            "active_manifest"
+        active_manifest = (
+            manifest_store.get(
+                "active_manifest"
+            )
         )
 
-        manifests = manifest_store.get(
-            "manifests",
-            {}
+        manifests = (
+            manifest_store.get(
+                "manifests",
+                {}
+            )
         )
 
-        # ----------------------------------------------------
-        # Nessun manifest
-        # ----------------------------------------------------
+        if not isinstance(
+            manifests,
+            dict
+        ):
 
-        if not active_label:
+            manifests = {}
 
-            result["status"] = "not_found"
+        result["manifest_count"] = len(
+            manifests
+        )
+
+        result["manifests"] = manifests
+
+        if not active_manifest:
+
+            result["status"] = (
+                "manifest_not_active"
+            )
 
             return result
 
         manifest = manifests.get(
-            active_label
+            active_manifest
         )
 
         if not manifest:
 
-            result["status"] = "invalid_manifest"
+            result["status"] = (
+                "active_manifest_missing"
+            )
+
+            result["active_manifest"] = (
+                active_manifest
+            )
 
             return result
 
-        # ----------------------------------------------------
-        # Manifest trovato
-        # ----------------------------------------------------
+        result["detected"] = True
 
-        result.update(
-            {
-                "detected": True,
-                "active_manifest": active_label,
-                "claim_generator": manifest.get(
-                    "claim_generator"
-                ),
-                "title": manifest.get(
-                    "title"
-                ),
-                "status": "manifest_detected"
-            }
+        result["status"] = (
+            "manifest_detected"
+        )
+
+        result["active_manifest"] = (
+            active_manifest
+        )
+
+        result["claim_generator"] = (
+            manifest.get(
+                "claim_generator"
+            )
+        )
+
+        result["title"] = (
+            manifest.get(
+                "title"
+            )
         )
 
         # ----------------------------------------------------
-        # NOTA:
-        #
-        # Reader ha trovato un manifest.
-        #
-        # La verifica crittografica completa della trust
-        # chain verrà ulteriormente implementata nel
-        # modulo C2PA dedicato.
-        #
-        # Per la pipeline attuale consideriamo il manifest
-        # rilevato come evidenza C2PA.
+        # Alcuni manifest C2PA possono contenere informazioni
+        # aggiuntive utili alla provenance.
         # ----------------------------------------------------
 
-        result["verified"] = True
+        if "assertions" in manifest:
+
+            result["assertion_count"] = len(
+                manifest.get(
+                    "assertions",
+                    []
+                )
+            )
+
+        if "ingredients" in manifest:
+
+            result["ingredient_count"] = len(
+                manifest.get(
+                    "ingredients",
+                    []
+                )
+            )
 
         return result
 
     except Exception as e:
 
-        print(
-            f"[C2PA] Errore per {mime_type}: {e}",
-            flush=True
+        result["status"] = "error"
+
+        result["error"] = str(
+            e
         )
 
-        result.update(
-            {
-                "detected": False,
-                "verified": False,
-                "status": "verification_error",
-                "error": str(e)
-            }
+        log(
+            f"C2PA engine error "
+            f"({mime_type}): {e}"
         )
 
         return result
 
 
 # ============================================================
-# 9. WATERMARK ENGINE
+# 9. JPEG METADATA ENGINE
 # ============================================================
 
-def run_watermark_detection(
+def analyze_jpeg_metadata(
+    file_bytes: bytes
+) -> dict:
+
+    result = {
+        "format": "jpeg",
+        "exif_present": False,
+        "xmp_present": False,
+        "iptc_present": False,
+        "software": None,
+        "creator": None,
+        "description": None,
+        "raw_markers": []
+    }
+
+    if not file_bytes.startswith(
+        b"\xff\xd8\xff"
+    ):
+
+        return result
+
+    position = 2
+
+    while position + 4 < len(
+        file_bytes
+    ):
+
+        if file_bytes[position] != 0xFF:
+
+            position += 1
+            continue
+
+        marker = file_bytes[
+            position + 1
+        ]
+
+        position += 2
+
+        # SOI / EOI / restart markers
+        if marker in (
+            0xD8,
+            0xD9
+        ):
+
+            continue
+
+        if position + 2 > len(
+            file_bytes
+        ):
+
+            break
+
+        segment_length = struct.unpack(
+            ">H",
+            file_bytes[
+                position:
+                position + 2
+            ]
+        )[0]
+
+        if segment_length < 2:
+
+            break
+
+        segment_end = (
+            position
+            + segment_length
+        )
+
+        if segment_end > len(
+            file_bytes
+        ):
+
+            break
+
+        segment = file_bytes[
+            position + 2:
+            segment_end
+        ]
+
+        # APP1
+        if marker == 0xE1:
+
+            if segment.startswith(
+                b"Exif\x00\x00"
+            ):
+
+                result["exif_present"] = True
+
+            if segment.startswith(
+                b"http://ns.adobe.com/xap/"
+            ):
+
+                result["xmp_present"] = True
+
+            if b"<x:xmpmeta" in segment:
+
+                result["xmp_present"] = True
+
+        # APP13 = IPTC / Photoshop
+        if marker == 0xED:
+
+            result["iptc_present"] = True
+
+        # APP0 / APP1 / APP13 etc.
+        result["raw_markers"].append(
+            hex(marker)
+        )
+
+        position = segment_end
+
+    return result
+
+
+# ============================================================
+# 10. PNG METADATA ENGINE
+# ============================================================
+
+def analyze_png_metadata(
+    file_bytes: bytes
+) -> dict:
+
+    result = {
+        "format": "png",
+        "text_chunks": [],
+        "xmp_present": False,
+        "software": None,
+        "creator": None,
+        "description": None
+    }
+
+    signature = (
+        b"\x89PNG\r\n\x1a\n"
+    )
+
+    if not file_bytes.startswith(
+        signature
+    ):
+
+        return result
+
+    position = 8
+
+    while position + 8 <= len(
+        file_bytes
+    ):
+
+        try:
+
+            length = struct.unpack(
+                ">I",
+                file_bytes[
+                    position:
+                    position + 4
+                ]
+            )[0]
+
+            chunk_type = file_bytes[
+                position + 4:
+                position + 8
+            ]
+
+            data_start = (
+                position + 8
+            )
+
+            data_end = (
+                data_start + length
+            )
+
+            if data_end > len(
+                file_bytes
+            ):
+
+                break
+
+            data = file_bytes[
+                data_start:
+                data_end
+            ]
+
+            chunk_name = (
+                chunk_type.decode(
+                    "latin-1",
+                    errors="ignore"
+                )
+            )
+
+            if chunk_type in (
+                b"tEXt",
+                b"zTXt",
+                b"iTXt"
+            ):
+
+                try:
+
+                    text = data.decode(
+                        "latin-1",
+                        errors="ignore"
+                    )
+
+                except Exception:
+
+                    text = ""
+
+                if text:
+
+                    result[
+                        "text_chunks"
+                    ].append(
+                        text[:1000]
+                    )
+
+                    text_lower = (
+                        text.lower()
+                    )
+
+                    if (
+                        "xmp" in text_lower
+                        or
+                        "xmpmeta" in text_lower
+                    ):
+
+                        result[
+                            "xmp_present"
+                        ] = True
+
+                    if (
+                        "software" in text_lower
+                    ):
+
+                        result[
+                            "software"
+                        ] = text[:500]
+
+                    if (
+                        "creator" in text_lower
+                    ):
+
+                        result[
+                            "creator"
+                        ] = text[:500]
+
+                    if (
+                        "description"
+                        in text_lower
+                    ):
+
+                        result[
+                            "description"
+                        ] = text[:500]
+
+            position = (
+                data_end + 4
+            )
+
+            if chunk_type == b"IEND":
+
+                break
+
+        except Exception:
+
+            break
+
+    return result
+
+
+# ============================================================
+# 11. GENERIC METADATA ENGINE
+# ============================================================
+
+def analyze_metadata(
     file_bytes: bytes,
     mime_type: str
 ) -> dict:
-    """
-    Interfaccia modulare per il futuro watermark engine.
 
-    NON inventiamo risultati.
+    result = {
+        "available": True,
+        "format": mime_type,
+        "exif_present": False,
+        "xmp_present": False,
+        "iptc_present": False,
+        "software": None,
+        "creator": None,
+        "description": None,
+        "signals": []
+    }
 
-    Quando collegheremo il motore reale basterà
-    sostituire questa funzione.
-    """
+    if mime_type == "image/jpeg":
 
-    media_type = classify_media_type(
-        mime_type
+        specific = analyze_jpeg_metadata(
+            file_bytes
+        )
+
+        result.update(
+            specific
+        )
+
+    elif mime_type == "image/png":
+
+        specific = analyze_png_metadata(
+            file_bytes
+        )
+
+        result.update(
+            specific
+        )
+
+    else:
+
+        result["available"] = False
+
+        result["reason"] = (
+            "Metadata parser specifico "
+            "non ancora implementato "
+            f"per {mime_type}."
+        )
+
+    # --------------------------------------------------------
+    # Metadata signals
+    # --------------------------------------------------------
+
+    if result.get(
+        "exif_present"
+    ):
+
+        result[
+            "signals"
+        ].append(
+            "exif_present"
+        )
+
+    if result.get(
+        "xmp_present"
+    ):
+
+        result[
+            "signals"
+        ].append(
+            "xmp_present"
+        )
+
+    if result.get(
+        "iptc_present"
+    ):
+
+        result[
+            "signals"
+        ].append(
+            "iptc_present"
+        )
+
+    software = result.get(
+        "software"
     )
 
-    return {
+    if software:
+
+        result[
+            "signals"
+        ].append(
+            "software_metadata_present"
+        )
+
+    creator = result.get(
+        "creator"
+    )
+
+    if creator:
+
+        result[
+            "signals"
+        ].append(
+            "creator_metadata_present"
+        )
+
+    return result
+
+
+# ============================================================
+# 12. WATERMARK ENGINE
+# ============================================================
+
+def check_watermark(
+    file_bytes: bytes,
+    mime_type: str
+) -> dict:
+
+    """
+    Questo engine NON dichiara l'assenza di watermark
+    semplicemente perché non trova una stringa.
+
+    Per ora effettua soltanto controlli strutturali
+    non invasivi.
+
+    Il detector visuale reale verrà collegato qui.
+    """
+
+    result = {
         "available": False,
         "detected": None,
-        "confidence": None,
         "status": "not_implemented",
-        "media_type": media_type,
-        "model": None,
-        "model_version": None,
+        "method": None,
         "signals": [],
         "detail": (
-            "Watermark detection engine "
+            "Watermark detection visuale "
             "non ancora collegato."
         )
     }
 
+    # --------------------------------------------------------
+    # Alcuni watermark testuali possono essere presenti
+    # nei metadata, ma questo NON equivale a watermark
+    # visuale.
+    # --------------------------------------------------------
+
+    if mime_type in (
+        "image/jpeg",
+        "image/png"
+    ):
+
+        result["status"] = (
+            "metadata_only"
+        )
+
+        result["detail"] = (
+            "Nessun detector visuale "
+            "collegato. I metadata vengono "
+            "analizzati separatamente."
+        )
+
+    return result
+
 
 # ============================================================
-# 10. AI DETECTION ENGINE
+# 13. AI DETECTION ENGINE
 # ============================================================
 
 def run_ai_detection(
     file_bytes: bytes,
     mime_type: str
 ) -> dict:
+
     """
-    Interfaccia modulare per il futuro AI detector.
+    Punto di integrazione per il vero modello
+    AI-generated detection.
 
-    NON restituisce score casuali.
-
-    Quando collegheremo il modello reale questa funzione
-    potrà restituire, per esempio:
-
-        available: true
-        score: 0.87
-        confidence: 0.91
-
-    senza modificare il resto della pipeline.
+    NON restituisce score arbitrari.
     """
-
-    media_type = classify_media_type(
-        mime_type
-    )
 
     return {
         "available": False,
         "score": None,
         "confidence": None,
         "status": "not_implemented",
-        "media_type": media_type,
         "model": None,
         "model_version": None,
         "signals": [],
         "detail": (
-            "AI detection engine "
+            "AI detection model reale "
             "non ancora collegato."
         )
     }
 
 
 # ============================================================
-# 11. METADATA ENGINE
+# 14. PROVENANCE / EVIDENCE ENGINE
 # ============================================================
 
-def extract_basic_metadata(
-    file_bytes: bytes,
-    mime_type: str
+def build_evidence(
+    file_analysis: dict,
+    c2pa_result: dict,
+    metadata_result: dict,
+    watermark_result: dict,
+    ai_result: dict
 ) -> dict:
-    """
-    Punto di estensione per EXIF, XMP, container metadata,
-    encoder information, ecc.
 
-    Per ora registriamo solamente informazioni sicure
-    già disponibili senza introdurre dipendenze aggiuntive.
-    """
+    signals = []
+
+    # --------------------------------------------------------
+    # C2PA
+    # --------------------------------------------------------
+
+    if c2pa_result.get(
+        "detected"
+    ):
+
+        signals.append(
+            {
+                "type": "c2pa",
+                "result": "present",
+                "confidence": 1.0,
+                "status": c2pa_result.get(
+                    "status"
+                )
+            }
+        )
+
+    else:
+
+        signals.append(
+            {
+                "type": "c2pa",
+                "result": "not_detected",
+                "confidence": None,
+                "status": c2pa_result.get(
+                    "status"
+                )
+            }
+        )
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    metadata_signals = (
+        metadata_result.get(
+            "signals",
+            []
+        )
+    )
+
+    for signal in metadata_signals:
+
+        signals.append(
+            {
+                "type": "metadata",
+                "result": signal,
+                "confidence": None
+            }
+        )
+
+    # --------------------------------------------------------
+    # AI detection
+    # --------------------------------------------------------
+
+    if ai_result.get(
+        "available"
+    ):
+
+        signals.append(
+            {
+                "type": "ai_detection",
+                "result": "available",
+                "score": ai_result.get(
+                    "score"
+                ),
+                "confidence": ai_result.get(
+                    "confidence"
+                )
+            }
+        )
+
+    else:
+
+        signals.append(
+            {
+                "type": "ai_detection",
+                "result": "unavailable",
+                "confidence": None
+            }
+        )
+
+    # --------------------------------------------------------
+    # Watermark
+    # --------------------------------------------------------
+
+    if watermark_result.get(
+        "available"
+    ):
+
+        signals.append(
+            {
+                "type": "watermark",
+                "result": watermark_result.get(
+                    "status"
+                ),
+                "detected": watermark_result.get(
+                    "detected"
+                )
+            }
+        )
+
+    else:
+
+        signals.append(
+            {
+                "type": "watermark",
+                "result": "unavailable"
+            }
+        )
+
+    # --------------------------------------------------------
+    # File integrity
+    # --------------------------------------------------------
+
+    signals.append(
+        {
+            "type": "file_integrity",
+            "result": "sha256_calculated",
+            "sha256": file_analysis.get(
+                "sha256"
+            )
+        }
+    )
 
     return {
-        "available": False,
-        "status": "basic_only",
-        "mime_type": mime_type,
-        "size_bytes": len(file_bytes)
+        "signal_count": len(
+            signals
+        ),
+        "signals": signals
     }
 
 
 # ============================================================
-# 12. EVIDENCE / COMPLIANCE ENGINE
+# 15. RISK ENGINE
+# ============================================================
+
+def calculate_risk(
+    c2pa_result: dict,
+    metadata_result: dict,
+    watermark_result: dict,
+    ai_result: dict
+) -> dict:
+
+    """
+    Risk engine trasparente.
+
+    Non usa un modello ML.
+    Non inventa probabilità.
+
+    Produce un rischio tecnico basato sulle evidenze
+    effettivamente disponibili.
+    """
+
+    risk_points = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # C2PA
+    # --------------------------------------------------------
+
+    if c2pa_result.get(
+        "detected"
+    ):
+
+        risk_points += 0
+
+    else:
+
+        risk_points += 40
+
+        reasons.append(
+            "C2PA manifest non rilevato."
+        )
+
+    # --------------------------------------------------------
+    # AI detector
+    # --------------------------------------------------------
+
+    if ai_result.get(
+        "available"
+    ):
+
+        score = ai_result.get(
+            "score"
+        )
+
+        if isinstance(
+            score,
+            (int, float)
+        ):
+
+            if score >= 0.80:
+
+                risk_points += 40
+
+                reasons.append(
+                    "AI detector indica "
+                    "alta probabilità di contenuto AI."
+                )
+
+            elif score >= 0.50:
+
+                risk_points += 20
+
+                reasons.append(
+                    "AI detector indica "
+                    "segnali intermedi di contenuto AI."
+                )
+
+    else:
+
+        reasons.append(
+            "AI detector non disponibile."
+        )
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    software = (
+        metadata_result.get(
+            "software"
+        )
+    )
+
+    if software:
+
+        software_lower = (
+            str(software)
+            .lower()
+        )
+
+        ai_software_terms = [
+            "midjourney",
+            "stable diffusion",
+            "dall-e",
+            "openai",
+            "adobe firefly",
+            "firefly",
+            "generative ai",
+            "generative",
+            "comfyui",
+            "automatic1111"
+        ]
+
+        for term in ai_software_terms:
+
+            if term in software_lower:
+
+                risk_points += 20
+
+                reasons.append(
+                    "Metadata software contiene "
+                    f"un indicatore compatibile con "
+                    f"generative AI: {term}."
+                )
+
+                break
+
+    # --------------------------------------------------------
+    # Clamp
+    # --------------------------------------------------------
+
+    risk_points = min(
+        max(
+            risk_points,
+            0
+        ),
+        100
+    )
+
+    risk_level = "low"
+
+    if risk_points >= 70:
+
+        risk_level = "high"
+
+    elif risk_points >= 40:
+
+        risk_level = "medium"
+
+    return {
+        "score": risk_points,
+        "level": risk_level,
+        "reasons": reasons
+    }
+
+
+# ============================================================
+# 16. COMPLIANCE ENGINE
 # ============================================================
 
 def evaluate_compliance(
     c2pa_result: dict,
-    watermark_result: dict,
     ai_result: dict,
-    metadata_result: dict
+    risk_result: dict
 ) -> dict:
+
     """
-    Trasforma le evidenze in una decisione.
+    ATTENZIONE:
 
-    Stato attuale:
+    Questo non è un parere legale.
 
-        C2PA rilevato
-            -> compliant
+    Il sistema valuta la presenza di evidenze tecniche
+    secondo le regole attualmente implementate.
 
-        C2PA non rilevato
-            -> non_compliant
+    Regola attuale:
 
-    IMPORTANTE:
+    C2PA presente + nessuna evidenza AI ad alto rischio
+        -> compliant
 
-    L'assenza di C2PA NON significa automaticamente
-    che il contenuto sia AI-generated.
+    C2PA assente
+        -> non_compliant
 
-    Significa solamente che non è stata trovata
-    un'evidenza C2PA.
-
-    Quando collegheremo AI detector e watermark engine,
-    questa funzione diventerà il vero Evidence Engine.
+    AI detector disponibile e molto alto
+        -> non_compliant
     """
 
     c2pa_detected = bool(
@@ -771,131 +1420,179 @@ def evaluate_compliance(
         )
     )
 
-    c2pa_status = c2pa_result.get(
-        "status"
+    ai_available = bool(
+        ai_result.get(
+            "available"
+        )
+    )
+
+    ai_score = ai_result.get(
+        "score"
     )
 
     # --------------------------------------------------------
-    # C2PA presente
+    # AI score molto alto
+    # --------------------------------------------------------
+
+    if (
+        ai_available
+        and
+        isinstance(
+            ai_score,
+            (int, float)
+        )
+        and
+        ai_score >= 0.80
+    ):
+
+        return {
+            "status": "non_compliant",
+            "reason": (
+                "Il motore AI detection "
+                "ha rilevato un'elevata "
+                "probabilità di contenuto AI."
+            )
+        }
+
+    # --------------------------------------------------------
+    # C2PA
     # --------------------------------------------------------
 
     if c2pa_detected:
 
         return {
-            "compliance_status": "compliant",
-
-            "risk_score": 0.10,
-
-            "decision": "compliant",
-
+            "status": "compliant",
             "reason": (
-                "Manifest C2PA rilevato."
-            ),
-
-            "requires_review": False,
-
-            "evidence_summary": {
-                "c2pa": True,
-                "c2pa_status": c2pa_status,
-                "watermark_available":
-                    watermark_result.get("available"),
-                "ai_detection_available":
-                    ai_result.get("available")
-            }
+                "Manifest C2PA rilevato. "
+                "Provenance tecnica disponibile."
+            )
         }
 
     # --------------------------------------------------------
-    # C2PA assente
+    # Nessun C2PA
     # --------------------------------------------------------
 
     return {
-        "compliance_status": "non_compliant",
-
-        "risk_score": None,
-
-        "decision": "non_compliant",
-
+        "status": "non_compliant",
         "reason": (
-            "Nessun manifest C2PA rilevato. "
-            "Il file richiede verifica/remediation."
-        ),
-
-        "requires_review": True,
-
-        "evidence_summary": {
-            "c2pa": False,
-            "c2pa_status": c2pa_status,
-            "watermark_available":
-                watermark_result.get("available"),
-            "ai_detection_available":
-                ai_result.get("available")
-        }
+            "Nessun manifest C2PA rilevato."
+        )
     }
 
 
 # ============================================================
-# 13. AUTO-FIX C2PA
+# 17. FIXER ENGINE
 # ============================================================
 
 def apply_c2pa_fix(
     file_bytes: bytes,
     audit_id: str,
     mime_type: str,
-    storage_path: str
+    file_name: str
 ):
     """
-    Placeholder per il futuro Fixer Engine.
+    Placeholder intenzionale.
 
-    NON crea una falsa firma C2PA.
+    NON viene generata una firma C2PA falsa.
 
-    In futuro:
+    Per creare una vera credenziale C2PA servono:
+    - signer
+    - private key
+    - certificato compatibile
+    - configurazione C2PA corretta
 
-        file
-          ↓
-        C2PA signer
-          ↓
-        file firmato
-          ↓
-        FIXER_BUCKET
-          ↓
-        fixed_file_url
+    Quando il signer sarà disponibile, questa funzione
+    produrrà il file remediato e lo caricherà nel bucket:
 
-    La funzione restituisce None finché non avremo
-    signer + certificato C2PA configurati.
+        Fixer AI-act shield
     """
 
-    print(
-        f"[FIXER] Auto-fix non ancora configurato "
-        f"per audit {audit_id}.",
-        flush=True
+    log(
+        f"Fixer richiesto per audit {audit_id}"
     )
 
-    print(
-        f"[FIXER] Bucket destinazione previsto: "
-        f"{FIXER_BUCKET}",
-        flush=True
-    )
-
-    print(
-        f"[FIXER] MIME: {mime_type}",
-        flush=True
-    )
-
-    print(
-        f"[FIXER] Source path: {storage_path}",
-        flush=True
+    log(
+        "Fixer C2PA non ancora attivo: "
+        "nessuna firma falsa verrà applicata."
     )
 
     return None
 
 
 # ============================================================
-# 14. DATABASE UPDATE
+# 18. UPLOAD FIXER
+# ============================================================
+
+def upload_fixed_file(
+    file_bytes: bytes,
+    audit_id: str,
+    file_name: str,
+    mime_type: str
+) -> str | None:
+
+    """
+    Funzione pronta per il futuro fixer.
+
+    Non viene chiamata finché non abbiamo un file
+    realmente remediato.
+    """
+
+    safe_name = (
+        file_name
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+    storage_path = (
+        f"{audit_id}/{safe_name}"
+    )
+
+    try:
+
+        (
+            supabase
+            .storage
+            .from_(FIXER_BUCKET)
+            .upload(
+                storage_path,
+                file_bytes,
+                {
+                    "content-type": mime_type,
+                    "upsert": "true"
+                }
+            )
+        )
+
+        log(
+            f"File fixer caricato: "
+            f"{FIXER_BUCKET}/{storage_path}"
+        )
+
+        # ----------------------------------------------------
+        # Il bucket può essere privato.
+        #
+        # Non costruiamo una URL pubblica automaticamente.
+        # Restituiamo il path interno.
+        # ----------------------------------------------------
+
+        return storage_path
+
+    except Exception as e:
+
+        log(
+            f"Errore upload fixer: {e}"
+        )
+
+        return None
+
+
+# ============================================================
+# 19. DATABASE UPDATE
 # ============================================================
 
 def update_audit(
-    audit_id: str,
-    data: dict
+    audit_id,
+    data
 ) -> bool:
 
     try:
@@ -912,40 +1609,36 @@ def update_audit(
         )
 
         updated_rows = (
-            response.data
-            or []
+            response.data or []
         )
 
         if not updated_rows:
 
-            print(
-                f"[DATABASE] ATTENZIONE: "
-                f"audit {audit_id} non aggiornato.",
-                flush=True
+            log(
+                f"ATTENZIONE: audit "
+                f"{audit_id} non aggiornato."
             )
 
             return False
 
-        print(
-            f"[DATABASE] Audit {audit_id} aggiornato.",
-            flush=True
+        log(
+            f"Audit {audit_id} aggiornato."
         )
 
         return True
 
     except Exception as e:
 
-        print(
-            f"[DATABASE] Errore aggiornamento "
-            f"audit {audit_id}: {e}",
-            flush=True
+        log(
+            f"Errore aggiornamento audit "
+            f"{audit_id}: {e}"
         )
 
         return False
 
 
 # ============================================================
-# 15. ERRORE AUDIT
+# 20. AUDIT ERROR
 # ============================================================
 
 def mark_audit_error(
@@ -976,7 +1669,7 @@ def mark_audit_error(
 
 
 # ============================================================
-# 16. PROCESSING SINGOLO AUDIT
+# 21. SINGOLO AUDIT
 # ============================================================
 
 def process_single_audit(
@@ -996,92 +1689,44 @@ def process_single_audit(
         "unknown"
     )
 
-    print(
-        "",
-        flush=True
+    log("")
+    log(
+        "============================================================"
     )
 
-    print(
-        "============================================================",
-        flush=True
+    log(
+        f"Audit pending: {audit_id}"
     )
 
-    print(
-        f"[WORKER] Audit: {audit_id}",
-        flush=True
+    log(
+        f"File: {file_name}"
     )
 
-    print(
-        f"[WORKER] File: {file_name}",
-        flush=True
+    log(
+        f"Storage path: {file_url}"
     )
 
-    print(
-        f"[WORKER] Storage path: {file_url}",
-        flush=True
-    )
-
-    print(
-        "============================================================",
-        flush=True
+    log(
+        "============================================================"
     )
 
     # --------------------------------------------------------
-    # VALIDAZIONE ID
+    # VALIDAZIONE
     # --------------------------------------------------------
 
     if not audit_id:
 
-        print(
-            "[WORKER] Audit senza ID. Ignorato.",
-            flush=True
+        log(
+            "Audit senza ID. Ignorato."
         )
 
         return
 
-    # --------------------------------------------------------
-    # VALIDAZIONE FILE URL
-    # --------------------------------------------------------
-
     if not file_url:
-
-        print(
-            f"[WORKER] Audit {audit_id}: "
-            f"file_url mancante.",
-            flush=True
-        )
 
         mark_audit_error(
             audit_id,
             "file_url mancante"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # NORMALIZE PATH
-    # --------------------------------------------------------
-
-    try:
-
-        storage_path = normalize_storage_path(
-            file_url
-        )
-
-    except Exception as e:
-
-        print(
-            f"[STORAGE] Path non valido: {e}",
-            flush=True
-        )
-
-        mark_audit_error(
-            audit_id,
-            "Storage path non valido",
-            {
-                "reason": str(e),
-                "file_url": file_url
-            }
         )
 
         return
@@ -1092,25 +1737,25 @@ def process_single_audit(
 
     try:
 
-        file_bytes = download_file_from_storage(
-            storage_path
+        file_bytes = (
+            download_file_from_storage(
+                file_url
+            )
         )
 
     except Exception as e:
 
-        print(
-            f"[DOWNLOAD] ERRORE audit "
-            f"{audit_id}: {e}",
-            flush=True
+        log(
+            f"DOWNLOAD ERROR: {e}"
         )
 
         mark_audit_error(
             audit_id,
-            "Impossibile scaricare il file da Supabase Storage",
+            "Impossibile scaricare "
+            "il file da Supabase Storage",
             {
                 "reason": str(e),
                 "file_url": file_url,
-                "storage_path": storage_path,
                 "bucket": MEDIA_BUCKET
             }
         )
@@ -1122,44 +1767,45 @@ def process_single_audit(
     # --------------------------------------------------------
 
     mime_type = detect_mime_type(
-        file_name or storage_path,
+        file_url,
         file_bytes
     )
 
-    media_type = classify_media_type(
+    log(
+        f"MIME: {mime_type}"
+    )
+
+    # --------------------------------------------------------
+    # FILE ENGINE
+    # --------------------------------------------------------
+
+    log(
+        "File engine: starting"
+    )
+
+    file_analysis = analyze_file(
+        file_bytes,
+        file_url,
+        file_name,
         mime_type
     )
 
-    print(
-        f"[ANALYSIS] MIME: {mime_type}",
-        flush=True
+    log(
+        f"File size: "
+        f"{file_analysis['size_bytes']} bytes"
     )
 
-    print(
-        f"[ANALYSIS] Media type: {media_type}",
-        flush=True
-    )
-
-    # --------------------------------------------------------
-    # HASH
-    # --------------------------------------------------------
-
-    file_hash = calculate_sha256(
-        file_bytes
-    )
-
-    print(
-        f"[ANALYSIS] SHA-256: {file_hash}",
-        flush=True
+    log(
+        f"SHA-256: "
+        f"{file_analysis['sha256']}"
     )
 
     # --------------------------------------------------------
     # C2PA
     # --------------------------------------------------------
 
-    print(
-        "[ANALYSIS] C2PA: starting",
-        flush=True
+    log(
+        "C2PA: starting"
     )
 
     c2pa_result = check_c2pa_metadata(
@@ -1173,49 +1819,64 @@ def process_single_audit(
         )
     )
 
-    print(
-        f"[ANALYSIS] C2PA detected: "
-        f"{c2pa_detected}",
-        flush=True
+    log(
+        f"C2PA detected: "
+        f"{c2pa_detected}"
     )
 
-    print(
-        f"[ANALYSIS] C2PA status: "
-        f"{c2pa_result.get('status')}",
-        flush=True
+    log(
+        f"C2PA status: "
+        f"{c2pa_result.get('status')}"
+    )
+
+    # --------------------------------------------------------
+    # METADATA
+    # --------------------------------------------------------
+
+    log(
+        "Metadata: starting"
+    )
+
+    metadata_result = analyze_metadata(
+        file_bytes,
+        mime_type
+    )
+
+    log(
+        "Metadata signals: "
+        f"{metadata_result.get('signals', [])}"
     )
 
     # --------------------------------------------------------
     # WATERMARK
     # --------------------------------------------------------
 
-    print(
-        "[ANALYSIS] Watermark: starting",
-        flush=True
+    log(
+        "Watermark: starting"
     )
 
-    watermark_result = run_watermark_detection(
+    watermark_result = check_watermark(
         file_bytes,
         mime_type
     )
 
-    watermark_detected = watermark_result.get(
-        "detected"
+    watermark_detected = (
+        watermark_result.get(
+            "detected"
+        )
     )
 
-    print(
-        f"[ANALYSIS] Watermark detected: "
-        f"{watermark_detected}",
-        flush=True
+    log(
+        f"Watermark detected: "
+        f"{watermark_detected}"
     )
 
     # --------------------------------------------------------
     # AI DETECTION
     # --------------------------------------------------------
 
-    print(
-        "[ANALYSIS] AI detection: starting",
-        flush=True
+    log(
+        "AI detection: starting"
     )
 
     ai_result = run_ai_detection(
@@ -1227,63 +1888,101 @@ def process_single_audit(
         "score"
     )
 
-    print(
-        f"[ANALYSIS] AI score: "
-        f"{ai_score}",
-        flush=True
-    )
-
-    # --------------------------------------------------------
-    # METADATA
-    # --------------------------------------------------------
-
-    print(
-        "[ANALYSIS] Metadata: starting",
-        flush=True
-    )
-
-    metadata_result = extract_basic_metadata(
-        file_bytes,
-        mime_type
+    log(
+        f"AI score: {ai_score}"
     )
 
     # --------------------------------------------------------
     # EVIDENCE ENGINE
     # --------------------------------------------------------
 
-    print(
-        "[ANALYSIS] Evidence engine: starting",
-        flush=True
+    log(
+        "Evidence engine: starting"
     )
 
-    evaluation = evaluate_compliance(
+    evidence_result = build_evidence(
+        file_analysis,
         c2pa_result,
+        metadata_result,
         watermark_result,
-        ai_result,
-        metadata_result
+        ai_result
     )
 
-    compliance_status = evaluation.get(
-        "compliance_status"
-    )
-
-    recommendation = evaluation.get(
-        "reason"
+    log(
+        "Evidence signals: "
+        f"{evidence_result.get('signal_count')}"
     )
 
     # --------------------------------------------------------
-    # AUTO-FIX
+    # RISK ENGINE
+    # --------------------------------------------------------
+
+    log(
+        "Risk engine: starting"
+    )
+
+    risk_result = calculate_risk(
+        c2pa_result,
+        metadata_result,
+        watermark_result,
+        ai_result
+    )
+
+    log(
+        f"Risk: "
+        f"{risk_result.get('level')} "
+        f"({risk_result.get('score')}/100)"
+    )
+
+    # --------------------------------------------------------
+    # COMPLIANCE ENGINE
+    # --------------------------------------------------------
+
+    log(
+        "Compliance engine: starting"
+    )
+
+    compliance_result = (
+        evaluate_compliance(
+            c2pa_result,
+            ai_result,
+            risk_result
+        )
+    )
+
+    compliance_status = (
+        compliance_result.get(
+            "status"
+        )
+    )
+
+    recommendation = (
+        compliance_result.get(
+            "reason"
+        )
+    )
+
+    log(
+        f"Compliance: "
+        f"{compliance_status}"
+    )
+
+    # --------------------------------------------------------
+    # FIXER
     # --------------------------------------------------------
 
     fixed_url = None
 
-    if not c2pa_detected:
+    if (
+        compliance_status
+        == "non_compliant"
+    ):
 
         fixed_url = apply_c2pa_fix(
             file_bytes,
             audit_id,
             mime_type,
-            storage_path
+            file_name
         )
 
     # --------------------------------------------------------
@@ -1294,54 +1993,50 @@ def process_single_audit(
 
         "worker": WORKER_NAME,
 
-        "worker_version": "2.0",
+        "engine_version": "2.0",
 
-        "file": {
+        "file": file_analysis,
 
-            "name": file_name,
-
-            "bucket": MEDIA_BUCKET,
-
-            "storage_path": storage_path,
-
-            "mime_type": mime_type,
-
-            "media_type": media_type,
-
-            "size_bytes": len(file_bytes),
-
-            "sha256": file_hash
+        "storage": {
+            "input_bucket": MEDIA_BUCKET,
+            "input_path": file_url,
+            "fixer_bucket": FIXER_BUCKET
         },
 
         "c2pa": c2pa_result,
+
+        "metadata": metadata_result,
 
         "watermark": watermark_result,
 
         "ai_detection": ai_result,
 
-        "metadata": metadata_result,
+        "evidence": evidence_result,
 
-        "evaluation": evaluation,
+        "risk": risk_result,
+
+        "compliance": compliance_result,
+
+        "recommendation": recommendation,
 
         "fixer": {
-
-            "available": False,
-
-            "bucket": FIXER_BUCKET,
-
-            "fixed_file_url": fixed_url
-        },
-
-        "recommendation": recommendation
+            "attempted": (
+                compliance_status
+                == "non_compliant"
+            ),
+            "fixed_file": (
+                fixed_url
+                is not None
+            )
+        }
     }
 
     # --------------------------------------------------------
-    # DATABASE UPDATE
+    # DATABASE
     # --------------------------------------------------------
 
-    print(
-        f"[DATABASE] Updating audit {audit_id}",
-        flush=True
+    log(
+        f"Updating audit {audit_id}"
     )
 
     update_data = {
@@ -1359,7 +2054,9 @@ def process_single_audit(
             ai_score,
 
         "file_hash":
-            file_hash,
+            file_analysis[
+                "sha256"
+            ],
 
         "fixed_file_url":
             fixed_url,
@@ -1375,51 +2072,51 @@ def process_single_audit(
 
     if not success:
 
-        print(
-            f"[DATABASE] ERRORE: "
-            f"impossibile completare "
-            f"update audit {audit_id}",
-            flush=True
+        log(
+            f"ERRORE: impossibile completare "
+            f"update audit {audit_id}"
         )
 
         return
 
     # --------------------------------------------------------
-    # COMPLETATO
+    # SUMMARY
     # --------------------------------------------------------
 
-    print(
-        f"[DATABASE] Audit {audit_id} completed: "
-        f"{compliance_status}",
-        flush=True
+    log(
+        "============================================================"
     )
 
-    print(
-        f"[DATABASE] C2PA: "
-        f"{c2pa_detected}",
-        flush=True
+    log(
+        f"Audit {audit_id} completed: "
+        f"{compliance_status}"
     )
 
-    print(
-        f"[DATABASE] AI score: "
-        f"{ai_score}",
-        flush=True
+    log(
+        f"C2PA: {c2pa_detected}"
     )
 
-    print(
-        f"[DATABASE] Watermark: "
-        f"{watermark_detected}",
-        flush=True
+    log(
+        f"AI score: {ai_score}"
     )
 
-    print(
-        "============================================================",
-        flush=True
+    log(
+        f"Watermark: {watermark_detected}"
+    )
+
+    log(
+        f"Risk: "
+        f"{risk_result.get('level')} "
+        f"({risk_result.get('score')}/100)"
+    )
+
+    log(
+        "============================================================"
     )
 
 
 # ============================================================
-# 17. ELABORAZIONE AUDIT PENDING
+# 22. PENDING AUDITS
 # ============================================================
 
 def process_pending_audits():
@@ -1442,40 +2139,26 @@ def process_pending_audits():
         )
 
         pending_audits = (
-            response.data
-            or []
+            response.data or []
         )
 
-        print(
-            f"[AI-ACT-SHIELD] "
-            f"AUDIT PENDING TROVATI: "
-            f"{len(pending_audits)}",
-            flush=True
+        log(
+            "AUDIT PENDING TROVATI: "
+            f"{len(pending_audits)}"
         )
 
         if not pending_audits:
 
-            print(
-                "[AI-ACT-SHIELD] "
-                "Nessun audit pending.",
-                flush=True
+            log(
+                "Nessun audit pending."
             )
 
             return
 
-        print(
-            f"[AI-ACT-SHIELD] "
+        log(
             f"Trovati {len(pending_audits)} "
-            f"audit pending.",
-            flush=True
+            "audit pending."
         )
-
-        # ----------------------------------------------------
-        # Elaborazione sequenziale.
-        #
-        # Questo evita di saturare il worker Render con
-        # molti file contemporaneamente.
-        # ----------------------------------------------------
 
         for audit in pending_audits:
 
@@ -1491,18 +2174,17 @@ def process_pending_audits():
                     "id"
                 )
 
-                print(
-                    f"[WORKER] Errore non gestito "
-                    f"nell'audit {audit_id}: {e}",
-                    flush=True
+                log(
+                    f"Errore non gestito "
+                    f"nell'audit {audit_id}: {e}"
                 )
 
                 if audit_id:
 
                     mark_audit_error(
                         audit_id,
-                        "Errore interno durante "
-                        "l'elaborazione",
+                        "Errore interno "
+                        "durante l'elaborazione",
                         {
                             "reason": str(e)
                         }
@@ -1510,59 +2192,46 @@ def process_pending_audits():
 
     except Exception as e:
 
-        print(
-            f"[AI-ACT-SHIELD] "
-            f"ERRORE ELABORAZIONE AUDIT: {e}",
-            flush=True
+        log(
+            "ERRORE ELABORAZIONE AUDIT: "
+            f"{e}"
         )
 
 
 # ============================================================
-# 18. WORKER LOOP
+# 23. WORKER LOOP
 # ============================================================
 
 def audit_loop():
 
-    print(
-        "[AI-ACT-SHIELD] "
-        "WORKER LOOP ATTIVO",
-        flush=True
+    log(
+        "WORKER LOOP ATTIVO"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
+    log(
         f"Intervallo: "
-        f"{WORKER_INTERVAL_SECONDS}s",
-        flush=True
+        f"{WORKER_INTERVAL_SECONDS}s"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
-        f"Media bucket: "
-        f"{MEDIA_BUCKET}",
-        flush=True
+    log(
+        f"Input bucket: "
+        f"{MEDIA_BUCKET}"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
+    log(
         f"Fixer bucket: "
-        f"{FIXER_BUCKET}",
-        flush=True
+        f"{FIXER_BUCKET}"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
+    log(
         f"Max file size: "
-        f"{MAX_FILE_SIZE_MB} MB",
-        flush=True
+        f"{MAX_FILE_SIZE_MB} MB"
     )
 
     while True:
 
-        print(
-            "[AI-ACT-SHIELD] "
-            "CICLO WORKER",
-            flush=True
+        log(
+            "CICLO WORKER"
         )
 
         try:
@@ -1571,10 +2240,8 @@ def audit_loop():
 
         except Exception as e:
 
-            print(
-                f"[AI-ACT-SHIELD] "
-                f"ERRORE WORKER: {e}",
-                flush=True
+            log(
+                f"ERRORE WORKER: {e}"
             )
 
         time.sleep(
@@ -1583,55 +2250,43 @@ def audit_loop():
 
 
 # ============================================================
-# 19. AVVIO
+# 24. STARTUP
 # ============================================================
 
 if __name__ == "__main__":
 
-    print(
-        "============================================================",
-        flush=True
+    log(
+        "============================================================"
     )
 
-    print(
-        "[AI-ACT-SHIELD] Avvio worker...",
-        flush=True
+    log(
+        "AI ACT SHIELD ANALYZER STARTING"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] Supabase: "
-        f"{SUPABASE_URL}",
-        flush=True
+    log(
+        f"Supabase: {SUPABASE_URL}"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
-        f"Media bucket: {MEDIA_BUCKET}",
-        flush=True
+    log(
+        f"Media bucket: {MEDIA_BUCKET}"
     )
 
-    print(
-        f"[AI-ACT-SHIELD] "
-        f"Fixer bucket: {FIXER_BUCKET}",
-        flush=True
+    log(
+        f"Fixer bucket: {FIXER_BUCKET}"
     )
 
-    print(
-        "============================================================",
-        flush=True
+    log(
+        f"Worker interval: "
+        f"{WORKER_INTERVAL_SECONDS}s"
     )
 
-    # --------------------------------------------------------
-    # Worker
-    # --------------------------------------------------------
+    log(
+        "============================================================"
+    )
 
     threading.Thread(
         target=audit_loop,
         daemon=True
     ).start()
-
-    # --------------------------------------------------------
-    # HTTP server Render
-    # --------------------------------------------------------
 
     run_http_server()

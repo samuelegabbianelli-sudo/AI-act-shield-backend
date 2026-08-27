@@ -6,6 +6,7 @@ import hashlib
 import threading
 import mimetypes
 import struct
+import tempfile
 
 from urllib.parse import urlparse, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -13,6 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from supabase import create_client, Client
 import c2pa
 
+from ai_detector import analyze_image
 
 # ============================================================
 # AI ACT SHIELD
@@ -1055,6 +1057,209 @@ def run_ai_detection(
     file_bytes: bytes,
     mime_type: str
 ) -> dict:
+
+    """
+    AI detection tramite Sightengine.
+
+    Il file viene temporaneamente scritto su disco perché
+    ai_detector.py espone un'interfaccia basata su file path.
+
+    Nessuno score viene inventato:
+    se Sightengine non risponde correttamente, score=None.
+    """
+
+    result = {
+        "available": False,
+        "provider": "sightengine",
+        "score": None,
+        "confidence": None,
+        "status": "not_available",
+        "model": "genai",
+        "model_version": None,
+        "signals": [],
+        "detail": None
+    }
+
+    # Sightengine AI detection viene usato per immagini.
+    if mime_type not in (
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+        "image/gif"
+    ):
+
+        result["status"] = "unsupported_mime"
+
+        result["detail"] = (
+            f"AI detection non eseguito per "
+            f"mime type {mime_type}."
+        )
+
+        log(
+            f"AI detector skipped: unsupported MIME {mime_type}"
+        )
+
+        return result
+
+    temp_path = None
+
+    try:
+
+        # ----------------------------------------------------
+        # Creiamo un file temporaneo.
+        # ----------------------------------------------------
+
+        suffix = ".bin"
+
+        if mime_type == "image/jpeg":
+            suffix = ".jpg"
+
+        elif mime_type == "image/png":
+            suffix = ".png"
+
+        elif mime_type == "image/webp":
+            suffix = ".webp"
+
+        elif mime_type == "image/gif":
+            suffix = ".gif"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False
+        ) as temp_file:
+
+            temp_file.write(file_bytes)
+            temp_path = temp_file.name
+
+        log(
+            f"AI detector: temporary file created"
+        )
+
+        # ----------------------------------------------------
+        # Sightengine
+        # ----------------------------------------------------
+
+        sightengine_result = analyze_image(
+            temp_path
+        )
+
+        if not isinstance(
+            sightengine_result,
+            dict
+        ):
+
+            result["status"] = "invalid_result"
+
+            result["detail"] = (
+                "AI detector ha restituito "
+                "un risultato non valido."
+            )
+
+            return result
+
+        available = bool(
+            sightengine_result.get(
+                "available"
+            )
+        )
+
+        ai_score = sightengine_result.get(
+            "ai_score"
+        )
+
+        if not available:
+
+            result["status"] = "unavailable"
+
+            result["detail"] = (
+                "Sightengine non ha restituito "
+                "uno score AI valido."
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # Score reale
+        # ----------------------------------------------------
+
+        if not isinstance(
+            ai_score,
+            (int, float)
+        ):
+
+            result["status"] = "invalid_score"
+
+            result["detail"] = (
+                "Sightengine ha restituito "
+                "uno score non numerico."
+            )
+
+            return result
+
+        ai_score = float(
+            ai_score
+        )
+
+        if not 0.0 <= ai_score <= 1.0:
+
+            result["status"] = "invalid_score"
+
+            result["detail"] = (
+                "Score AI fuori dal range 0-1."
+            )
+
+            return result
+
+        result["available"] = True
+
+        result["score"] = ai_score
+
+        result["status"] = "success"
+
+        result["detail"] = (
+            "AI-generated detection eseguito "
+            "tramite Sightengine."
+        )
+
+        result["signals"].append(
+            "sightengine_genai"
+        )
+
+        log(
+            f"AI detector: Sightengine score={ai_score}"
+        )
+
+        return result
+
+    except Exception as e:
+
+        log(
+            f"AI detector error: {e}"
+        )
+
+        result["status"] = "error"
+
+        result["detail"] = str(e)
+
+        return result
+
+    finally:
+
+        # ----------------------------------------------------
+        # Elimina sempre il file temporaneo.
+        # ----------------------------------------------------
+
+        if temp_path:
+
+            try:
+
+                os.remove(
+                    temp_path
+                )
+
+            except OSError:
+
+                pass
 
     """
     Punto di integrazione per il vero modello

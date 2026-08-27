@@ -472,16 +472,30 @@ def check_c2pa_metadata(
 
     result = {
         "detected": False,
+        "valid": False,
+        "trusted": False,
         "status": "not_detected",
+
         "claim_generator": None,
         "title": None,
+
         "active_manifest": None,
         "manifest_count": 0,
         "manifests": {},
+
+        "validation_status": [],
+        "validation_errors": [],
+
         "error": None
     }
 
     try:
+
+        # ----------------------------------------------------
+        # Reader C2PA
+        #
+        # Il Reader legge e valida il manifest.
+        # ----------------------------------------------------
 
         stream = io.BytesIO(
             file_bytes
@@ -497,6 +511,10 @@ def check_c2pa_metadata(
         manifest_store = json.loads(
             raw_json
         )
+
+        # ----------------------------------------------------
+        # Manifest store
+        # ----------------------------------------------------
 
         active_manifest = (
             manifest_store.get(
@@ -524,6 +542,10 @@ def check_c2pa_metadata(
 
         result["manifests"] = manifests
 
+        # ----------------------------------------------------
+        # Nessun active manifest
+        # ----------------------------------------------------
+
         if not active_manifest:
 
             result["status"] = (
@@ -531,6 +553,244 @@ def check_c2pa_metadata(
             )
 
             return result
+
+        result["active_manifest"] = (
+            active_manifest
+        )
+
+        # ----------------------------------------------------
+        # Recuperiamo il manifest attivo
+        # ----------------------------------------------------
+
+        manifest = manifests.get(
+            active_manifest
+        )
+
+        if not manifest:
+
+            result["status"] = (
+                "active_manifest_missing"
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # Manifest C2PA trovato
+        # ----------------------------------------------------
+
+        result["detected"] = True
+
+        result["claim_generator"] = (
+            manifest.get(
+                "claim_generator"
+            )
+        )
+
+        result["title"] = (
+            manifest.get(
+                "title"
+            )
+        )
+
+        # ----------------------------------------------------
+        # Validation status
+        #
+        # C2PA può riportare validation_status
+        # all'interno del manifest.
+        # ----------------------------------------------------
+
+        validation_status = (
+            manifest.get(
+                "validation_status",
+                []
+            )
+        )
+
+        if not isinstance(
+            validation_status,
+            list
+        ):
+
+            validation_status = []
+
+        result["validation_status"] = (
+            validation_status
+        )
+
+        # ----------------------------------------------------
+        # Analizziamo gli eventuali errori
+        # ----------------------------------------------------
+
+        validation_errors = []
+
+        for item in validation_status:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+
+                continue
+
+            code = item.get(
+                "code"
+            )
+
+            explanation = item.get(
+                "explanation"
+            )
+
+            success = item.get(
+                "success"
+            )
+
+            # Un elemento con success=False
+            # è esplicitamente fallito.
+            if success is False:
+
+                validation_errors.append(
+                    {
+                        "code": code,
+                        "explanation": explanation
+                    }
+                )
+
+            # Alcune versioni/manifest possono
+            # riportare un codice di errore
+            # senza il campo success.
+            elif (
+                code
+                and
+                not str(code).lower().startswith(
+                    (
+                        "success",
+                        "valid"
+                    )
+                )
+            ):
+
+                validation_errors.append(
+                    {
+                        "code": code,
+                        "explanation": explanation
+                    }
+                )
+
+        result["validation_errors"] = (
+            validation_errors
+        )
+
+        # ----------------------------------------------------
+        # VALIDITÀ
+        #
+        # Se non abbiamo validation errors,
+        # consideriamo il manifest tecnicamente valido.
+        # ----------------------------------------------------
+
+        if validation_errors:
+
+            result["valid"] = False
+
+            result["status"] = (
+                "validation_failed"
+            )
+
+        else:
+
+            result["valid"] = True
+
+            result["status"] = (
+                "valid"
+            )
+
+        # ----------------------------------------------------
+        # TRUST
+        #
+        # Per ora NON dichiariamo automaticamente
+        # trusted=True.
+        #
+        # La verifica della catena di trust richiede
+        # una configurazione esplicita dei trust anchors.
+        # ----------------------------------------------------
+
+        result["trusted"] = False
+
+        if result["valid"]:
+
+            result["status"] = (
+                "valid_untrusted"
+            )
+
+        # ----------------------------------------------------
+        # Informazioni aggiuntive
+        # ----------------------------------------------------
+
+        if "assertions" in manifest:
+
+            assertions = manifest.get(
+                "assertions",
+                []
+            )
+
+            if isinstance(
+                assertions,
+                list
+            ):
+
+                result["assertion_count"] = (
+                    len(assertions)
+                )
+
+        if "ingredients" in manifest:
+
+            ingredients = manifest.get(
+                "ingredients",
+                []
+            )
+
+            if isinstance(
+                ingredients,
+                list
+            ):
+
+                result["ingredient_count"] = (
+                    len(ingredients)
+                )
+
+        log(
+            "C2PA validation: "
+            f"detected={result['detected']} "
+            f"valid={result['valid']} "
+            f"trusted={result['trusted']} "
+            f"status={result['status']}"
+        )
+
+        if validation_errors:
+
+            log(
+                "C2PA validation errors: "
+                f"{validation_errors}"
+            )
+
+        return result
+
+    except Exception as e:
+
+        result["status"] = "error"
+
+        result["error"] = str(
+            e
+        )
+
+        result["valid"] = False
+        result["trusted"] = False
+
+        log(
+            f"C2PA engine error "
+            f"({mime_type}): {e}"
+        )
+
+        return result
 
         manifest = manifests.get(
             active_manifest

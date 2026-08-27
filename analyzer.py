@@ -7,19 +7,21 @@ import threading
 import mimetypes
 import struct
 import tempfile
+import urllib.request
 
 from urllib.parse import urlparse, unquote
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from supabase import create_client, Client
 import c2pa
+from c2pa import Context
 
 from ai_detector import analyze_image
 
 
 # ============================================================
 # AI ACT SHIELD
-# ANALYZER ENGINE 2.1
+# ANALYZER ENGINE 2.2
 #
 # Pipeline:
 #
@@ -47,6 +49,41 @@ from ai_detector import analyze_image
 # - "compliant" indica conformità tecnica rispetto alle
 #   regole attualmente implementate, NON certificazione
 #   legale definitiva di conformità all'AI Act.
+#
+# C2PA v2.2:
+#
+# detected:
+#   Manifest C2PA rilevato.
+#
+# valid:
+#   Integrità/validazione tecnica del manifest considerata
+#   valida, anche se il certificato di firma non è trusted.
+#
+# trusted:
+#   Signing credential trusted rispetto alla trust list
+#   C2PA configurata.
+#
+# signingCredential.untrusted:
+#   NON viene trattato come una firma/hash corrotta.
+#   Viene distinto da un failure reale di integrità.
+#
+# Stati C2PA principali:
+#
+#   not_detected
+#       Nessun manifest C2PA.
+#
+#   valid_untrusted
+#       Manifest tecnicamente valido ma signer non trusted.
+#
+#   trusted
+#       Manifest valido e signer trusted.
+#
+#   invalid
+#       Manifest presente con failure reali di validazione.
+#
+#   detected_unverified
+#       Manifest rilevato ma impossibile dimostrare
+#       sufficientemente validità/trust.
 # ============================================================
 
 
@@ -54,7 +91,7 @@ from ai_detector import analyze_image
 # 1. CONFIGURAZIONE
 # ============================================================
 
-ENGINE_VERSION = "2.1"
+ENGINE_VERSION = "2.2"
 WORKER_NAME = "AI Act Shield"
 
 SUPABASE_URL = os.environ.get(
@@ -96,6 +133,52 @@ MAX_FILE_SIZE_BYTES = (
 )
 
 
+# ============================================================
+# C2PA TRUST CONFIGURATION
+# ============================================================
+
+# Trust list ufficiale C2PA.
+#
+# Fonte:
+# c2pa-org/conformance-public
+#
+# Può essere sovrascritta tramite Environment Variable.
+C2PA_TRUST_LIST_URL = os.environ.get(
+    "C2PA_TRUST_LIST_URL",
+    "https://raw.githubusercontent.com/"
+    "c2pa-org/conformance-public/"
+    "refs/heads/main/trust-list/C2PA-TRUST-LIST.pem"
+)
+
+C2PA_TRUST_LIST_TIMEOUT_SECONDS = int(
+    os.environ.get(
+        "C2PA_TRUST_LIST_TIMEOUT_SECONDS",
+        "15"
+    )
+)
+
+# Se presente, questo PEM ha precedenza sulla URL.
+#
+# Deve contenere uno o più certificati PEM:
+#
+# -----BEGIN CERTIFICATE-----
+# ...
+# -----END CERTIFICATE-----
+#
+C2PA_TRUST_ANCHORS_PEM = os.environ.get(
+    "C2PA_TRUST_ANCHORS_PEM",
+    ""
+)
+
+C2PA_CONTEXT = None
+
+C2PA_TRUST_SOURCE = None
+
+
+# ============================================================
+# SUPABASE CLIENT
+# ============================================================
+
 if not SUPABASE_SECRET_KEY:
     raise RuntimeError(
         "SUPABASE_SECRET_KEY non configurata "
@@ -121,7 +204,186 @@ def log(message: str):
 
 
 # ============================================================
-# 3. HTTP SERVER PER RENDER
+# 3. C2PA TRUST INITIALIZATION
+# ============================================================
+
+def load_c2pa_trust_anchors() -> tuple[str, str]:
+
+    # --------------------------------------------------------
+    # 1. PEM fornito direttamente da Environment Variable
+    # --------------------------------------------------------
+
+    if C2PA_TRUST_ANCHORS_PEM.strip():
+
+        pem = (
+            C2PA_TRUST_ANCHORS_PEM
+            .strip()
+        )
+
+        if "BEGIN CERTIFICATE" not in pem:
+
+            raise RuntimeError(
+                "C2PA_TRUST_ANCHORS_PEM configurata "
+                "ma non contiene certificati PEM validi."
+            )
+
+        log(
+            "C2PA trust list: "
+            "usando PEM fornito via Environment Variable."
+        )
+
+        return (
+            pem,
+            "environment"
+        )
+
+    # --------------------------------------------------------
+    # 2. Trust List ufficiale C2PA
+    # --------------------------------------------------------
+
+    log(
+        "C2PA trust list: "
+        f"download da {C2PA_TRUST_LIST_URL}"
+    )
+
+    try:
+
+        request = urllib.request.Request(
+            C2PA_TRUST_LIST_URL,
+            headers={
+                "User-Agent":
+                    f"{WORKER_NAME}/{ENGINE_VERSION}"
+            }
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=C2PA_TRUST_LIST_TIMEOUT_SECONDS
+        ) as response:
+
+            pem_bytes = response.read()
+
+        pem = (
+            pem_bytes
+            .decode("utf-8")
+            .strip()
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "Impossibile caricare la trust list C2PA "
+            f"da {C2PA_TRUST_LIST_URL}: {e}"
+        ) from e
+
+    if not pem:
+
+        raise RuntimeError(
+            "La trust list C2PA è vuota."
+        )
+
+    if "BEGIN CERTIFICATE" not in pem:
+
+        raise RuntimeError(
+            "La trust list C2PA scaricata non contiene "
+            "certificati PEM."
+        )
+
+    log(
+        "C2PA trust list: caricata correttamente."
+    )
+
+    return (
+        pem,
+        C2PA_TRUST_LIST_URL
+    )
+
+
+def initialize_c2pa_context():
+
+    global C2PA_CONTEXT
+    global C2PA_TRUST_SOURCE
+
+    anchors, source = (
+        load_c2pa_trust_anchors()
+    )
+
+    # --------------------------------------------------------
+    # Context C2PA
+    #
+    # trust_anchors:
+    #   usa esplicitamente la trust list configurata.
+    #
+    # verify_trust:
+    #   abilita la verifica del signing credential.
+    #
+    # verify_after_reading:
+    #   mantiene attiva la verifica durante la lettura.
+    #
+    # remote_manifest_fetch:
+    #   mantiene la possibilità di recuperare manifest
+    #   remoti referenziati dal contenuto.
+    # --------------------------------------------------------
+
+    config = {
+
+        "trust": {
+
+            "trust_anchors":
+                anchors
+        },
+
+        "verify": {
+
+            "verify_after_reading":
+                True,
+
+            "verify_trust":
+                True,
+
+            "verify_timestamp_trust":
+                True,
+
+            "ocsp_fetch":
+                False,
+
+            "remote_manifest_fetch":
+                True
+        }
+    }
+
+    try:
+
+        C2PA_CONTEXT = Context.from_dict(
+            config
+        )
+
+    except Exception as e:
+
+        raise RuntimeError(
+            "Impossibile inizializzare "
+            "il Context C2PA: "
+            f"{e}"
+        ) from e
+
+    C2PA_TRUST_SOURCE = source
+
+    log(
+        "C2PA context inizializzato."
+    )
+
+    log(
+        "C2PA trust verification: ENABLED"
+    )
+
+    log(
+        "C2PA trust source: "
+        f"{C2PA_TRUST_SOURCE}"
+    )
+
+
+# ============================================================
+# 4. HTTP SERVER PER RENDER
 # ============================================================
 
 class SimpleHTTPRequestHandler(
@@ -140,18 +402,36 @@ class SimpleHTTPRequestHandler(
         self.end_headers()
 
         response = {
-            "service": WORKER_NAME,
-            "engine_version": ENGINE_VERSION,
-            "status": "running",
-            "worker_interval_seconds": (
-                WORKER_INTERVAL_SECONDS
-            ),
-            "media_bucket": MEDIA_BUCKET,
-            "fixer_bucket": FIXER_BUCKET
+
+            "service":
+                WORKER_NAME,
+
+            "engine_version":
+                ENGINE_VERSION,
+
+            "status":
+                "running",
+
+            "worker_interval_seconds":
+                WORKER_INTERVAL_SECONDS,
+
+            "media_bucket":
+                MEDIA_BUCKET,
+
+            "fixer_bucket":
+                FIXER_BUCKET,
+
+            "c2pa_trust_enabled":
+                C2PA_CONTEXT is not None,
+
+            "c2pa_trust_source":
+                C2PA_TRUST_SOURCE
         }
 
         self.wfile.write(
-            json.dumps(response).encode("utf-8")
+            json.dumps(
+                response
+            ).encode("utf-8")
         )
 
     def do_HEAD(self):
@@ -200,12 +480,13 @@ def run_http_server():
 
 
 # ============================================================
-# 4. NORMALIZZAZIONE STORAGE PATH
+# 5. NORMALIZZAZIONE STORAGE PATH
 # ============================================================
 
 def normalize_storage_path(
     file_url: str
 ) -> str:
+
     """
     Supporta:
 
@@ -215,11 +496,14 @@ def normalize_storage_path(
     """
 
     if not file_url:
+
         raise ValueError(
             "file_url vuoto"
         )
 
-    value = str(file_url).strip()
+    value = str(
+        file_url
+    ).strip()
 
     # --------------------------------------------------------
     # Path già relativo
@@ -231,6 +515,7 @@ def normalize_storage_path(
             "https://"
         )
     ):
+
         return unquote(
             value.lstrip("/")
         )
@@ -239,23 +524,28 @@ def normalize_storage_path(
     # URL Supabase Storage
     # --------------------------------------------------------
 
-    parsed = urlparse(value)
+    parsed = urlparse(
+        value
+    )
 
     path = unquote(
         parsed.path.lstrip("/")
     )
 
     markers = [
+
         (
             "storage/v1/object/public/"
             + MEDIA_BUCKET
             + "/"
         ),
+
         (
             "storage/v1/object/sign/"
             + MEDIA_BUCKET
             + "/"
         ),
+
         (
             "storage/v1/object/authenticated/"
             + MEDIA_BUCKET
@@ -278,7 +568,7 @@ def normalize_storage_path(
 
 
 # ============================================================
-# 5. DOWNLOAD FILE
+# 6. DOWNLOAD FILE
 # ============================================================
 
 def download_file_from_storage(
@@ -320,7 +610,9 @@ def download_file_from_storage(
             "un file vuoto."
         )
 
-    file_size = len(file_bytes)
+    file_size = len(
+        file_bytes
+    )
 
     log(
         f"Download completato: {file_size} bytes"
@@ -334,17 +626,21 @@ def download_file_from_storage(
             f"Limite: {MAX_FILE_SIZE_MB} MB."
         )
 
-    return file_bytes, storage_path
+    return (
+        file_bytes,
+        storage_path
+    )
 
 
 # ============================================================
-# 6. MIME TYPE
+# 7. MIME TYPE
 # ============================================================
 
 def detect_mime_type(
     file_url: str,
     file_bytes: bytes
 ) -> str:
+
     """
     Prima usa i magic bytes.
     Solo successivamente prova l'estensione.
@@ -357,6 +653,7 @@ def detect_mime_type(
     if file_bytes.startswith(
         b"\xff\xd8\xff"
     ):
+
         return "image/jpeg"
 
     # --------------------------------------------------------
@@ -366,6 +663,7 @@ def detect_mime_type(
     if file_bytes.startswith(
         b"\x89PNG\r\n\x1a\n"
     ):
+
         return "image/png"
 
     # --------------------------------------------------------
@@ -373,10 +671,15 @@ def detect_mime_type(
     # --------------------------------------------------------
 
     if (
-        file_bytes.startswith(b"GIF87a")
+        file_bytes.startswith(
+            b"GIF87a"
+        )
         or
-        file_bytes.startswith(b"GIF89a")
+        file_bytes.startswith(
+            b"GIF89a"
+        )
     ):
+
         return "image/gif"
 
     # --------------------------------------------------------
@@ -388,6 +691,7 @@ def detect_mime_type(
         and file_bytes[:4] == b"RIFF"
         and file_bytes[8:12] == b"WEBP"
     ):
+
         return "image/webp"
 
     # --------------------------------------------------------
@@ -397,6 +701,7 @@ def detect_mime_type(
     if file_bytes.startswith(
         b"%PDF-"
     ):
+
         return "application/pdf"
 
     # --------------------------------------------------------
@@ -404,10 +709,15 @@ def detect_mime_type(
     # --------------------------------------------------------
 
     if (
-        file_bytes.startswith(b"ID3")
+        file_bytes.startswith(
+            b"ID3"
+        )
         or
-        file_bytes.startswith(b"\xff\xfb")
+        file_bytes.startswith(
+            b"\xff\xfb"
+        )
     ):
+
         return "audio/mpeg"
 
     # --------------------------------------------------------
@@ -418,6 +728,7 @@ def detect_mime_type(
         len(file_bytes) >= 12
         and file_bytes[4:8] == b"ftyp"
     ):
+
         return "video/mp4"
 
     # --------------------------------------------------------
@@ -429,13 +740,14 @@ def detect_mime_type(
     )
 
     if mime_type:
+
         return mime_type
 
     return "application/octet-stream"
 
 
 # ============================================================
-# 7. FILE ENGINE
+# 8. FILE ENGINE
 # ============================================================
 
 def analyze_file(
@@ -460,77 +772,328 @@ def analyze_file(
     ).hexdigest()
 
     return {
-        "file_name": file_name,
-        "mime_type": mime_type,
-        "extension": extension,
-        "size_bytes": len(file_bytes),
-        "sha256": sha256,
-        "storage_path": storage_path
+
+        "file_name":
+            file_name,
+
+        "mime_type":
+            mime_type,
+
+        "extension":
+            extension,
+
+        "size_bytes":
+            len(file_bytes),
+
+        "sha256":
+            sha256,
+
+        "storage_path":
+            storage_path
     }
 
 
 # ============================================================
-# 8. C2PA ENGINE
+# 9. C2PA VALIDATION HELPERS
 # ============================================================
+
+def _flatten_validation_status(
+    validation_status
+) -> list:
+
+    """
+    Normalizza i diversi formati restituiti da C2PA.
+
+    Formato possibile:
+
+        [
+            {
+                "code": "...",
+                "explanation": "..."
+            }
+        ]
+
+    oppure:
+
+        {
+            "success": [...],
+            "informational": [...],
+            "failure": [...]
+        }
+    """
+
+    flattened = []
+
+    if isinstance(
+        validation_status,
+        list
+    ):
+
+        for item in validation_status:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+
+                continue
+
+            flattened.append(
+                {
+                    "code":
+                        item.get(
+                            "code"
+                        ),
+
+                    "explanation":
+                        item.get(
+                            "explanation"
+                        ),
+
+                    "success":
+                        item.get(
+                            "success"
+                        ),
+
+                    "category":
+                        None
+                }
+            )
+
+        return flattened
+
+    if isinstance(
+        validation_status,
+        dict
+    ):
+
+        for category in (
+            "success",
+            "informational",
+            "failure"
+        ):
+
+            entries = (
+                validation_status.get(
+                    category,
+                    []
+                )
+            )
+
+            if not isinstance(
+                entries,
+                list
+            ):
+
+                continue
+
+            for item in entries:
+
+                if not isinstance(
+                    item,
+                    dict
+                ):
+
+                    continue
+
+                flattened.append(
+                    {
+                        "code":
+                            item.get(
+                                "code"
+                            ),
+
+                        "explanation":
+                            item.get(
+                                "explanation"
+                            ),
+
+                        "success":
+                            item.get(
+                                "success"
+                            ),
+
+                        "category":
+                            category
+                    }
+                )
+
+    return flattened
+
 
 def _extract_validation_errors(
     validation_status
 ) -> list:
 
+    """
+    Restituisce esclusivamente failure REALI.
+
+    IMPORTANTE:
+
+    signingCredential.untrusted viene escluso
+    dagli errori di integrità.
+
+    Questo codice significa:
+
+        il certificato del signer non è trusted
+
+    e NON significa automaticamente:
+
+        hash/signature/manifest corrotti.
+    """
+
     errors = []
 
-    if not isinstance(
-        validation_status,
-        list
-    ):
-        return errors
+    statuses = _flatten_validation_status(
+        validation_status
+    )
 
-    for item in validation_status:
+    for item in statuses:
 
-        if not isinstance(
-            item,
-            dict
-        ):
+        code = item.get(
+            "code"
+        )
+
+        if not code:
+
             continue
 
-        code = item.get("code")
-        explanation = item.get("explanation")
-        success = item.get("success")
+        category = item.get(
+            "category"
+        )
 
-        # Fallimento esplicito
-        if success is False:
+        success = item.get(
+            "success"
+        )
+
+        # ----------------------------------------------------
+        # UNTRUSTED
+        # ----------------------------------------------------
+
+        if code == (
+            "signingCredential.untrusted"
+        ):
+
+            continue
+
+        # ----------------------------------------------------
+        # Failure esplicito
+        # ----------------------------------------------------
+
+        if category == "failure":
 
             errors.append(
                 {
-                    "code": code,
-                    "explanation": explanation
+                    "code":
+                        code,
+
+                    "explanation":
+                        item.get(
+                            "explanation"
+                        )
                 }
             )
 
             continue
 
-        # Alcuni manifest possono fornire
-        # direttamente un codice di errore.
-        if (
-            code
-            and
-            not str(code).lower().startswith(
-                (
-                    "success",
-                    "valid"
-                )
-            )
-        ):
+        # ----------------------------------------------------
+        # Compatibilità con formati legacy
+        # ----------------------------------------------------
+
+        if success is False:
 
             errors.append(
                 {
-                    "code": code,
-                    "explanation": explanation
+                    "code":
+                        code,
+
+                    "explanation":
+                        item.get(
+                            "explanation"
+                        )
                 }
             )
 
     return errors
 
+
+def _extract_untrusted_credentials(
+    validation_status
+) -> list:
+
+    untrusted = []
+
+    statuses = _flatten_validation_status(
+        validation_status
+    )
+
+    for item in statuses:
+
+        if item.get(
+            "code"
+        ) == "signingCredential.untrusted":
+
+            untrusted.append(
+                {
+                    "code":
+                        item.get(
+                            "code"
+                        ),
+
+                    "explanation":
+                        item.get(
+                            "explanation"
+                        )
+                }
+            )
+
+    return untrusted
+
+
+def _extract_success_codes(
+    validation_status
+) -> list:
+
+    codes = []
+
+    statuses = _flatten_validation_status(
+        validation_status
+    )
+
+    for item in statuses:
+
+        code = item.get(
+            "code"
+        )
+
+        if not code:
+
+            continue
+
+        category = item.get(
+            "category"
+        )
+
+        success = item.get(
+            "success"
+        )
+
+        if (
+            category == "success"
+            or
+            success is True
+        ):
+
+            codes.append(
+                code
+            )
+
+    return codes
+
+
+# ============================================================
+# 10. C2PA ENGINE
+# ============================================================
 
 def check_c2pa_metadata(
     file_bytes: bytes,
@@ -539,39 +1102,105 @@ def check_c2pa_metadata(
 
     result = {
 
-        "detected": False,
+        # ----------------------------------------------------
+        # Distinzione fondamentale
+        # ----------------------------------------------------
 
-        "valid": False,
+        "detected":
+            False,
 
-        "trusted": False,
+        "valid":
+            False,
 
-        "status": "not_detected",
+        "trusted":
+            False,
 
-        "claim_generator": None,
+        # ----------------------------------------------------
+        # Stato C2PA
+        # ----------------------------------------------------
 
-        "title": None,
+        "status":
+            "not_detected",
 
-        "active_manifest": None,
+        "validation_state":
+            None,
 
-        "manifest_count": 0,
+        # ----------------------------------------------------
+        # Trust
+        # ----------------------------------------------------
 
-        "assertion_count": 0,
+        "trust_source":
+            C2PA_TRUST_SOURCE,
 
-        "ingredient_count": 0,
+        "trust_verification_enabled":
+            C2PA_CONTEXT is not None,
 
-        "manifests": {},
+        # ----------------------------------------------------
+        # Manifest
+        # ----------------------------------------------------
 
-        "validation_status": [],
+        "claim_generator":
+            None,
 
-        "validation_errors": [],
+        "title":
+            None,
 
-        "error": None
+        "active_manifest":
+            None,
+
+        "manifest_count":
+            0,
+
+        "assertion_count":
+            0,
+
+        "ingredient_count":
+            0,
+
+        "manifests":
+            {},
+
+        # ----------------------------------------------------
+        # Validation
+        # ----------------------------------------------------
+
+        "validation_status":
+            [],
+
+        "validation_results":
+            None,
+
+        "validation_errors":
+            [],
+
+        "untrusted_credentials":
+            [],
+
+        "success_codes":
+            [],
+
+        # ----------------------------------------------------
+        # Error
+        # ----------------------------------------------------
+
+        "error":
+            None
     }
 
     try:
 
         # ----------------------------------------------------
-        # C2PA Reader
+        # Context
+        # ----------------------------------------------------
+
+        if C2PA_CONTEXT is None:
+
+            raise RuntimeError(
+                "C2PA Context non inizializzato."
+            )
+
+        # ----------------------------------------------------
+        # Reader
         # ----------------------------------------------------
 
         stream = io.BytesIO(
@@ -580,7 +1209,8 @@ def check_c2pa_metadata(
 
         reader = c2pa.Reader(
             mime_type,
-            stream
+            stream,
+            context=C2PA_CONTEXT
         )
 
         raw_json = reader.json()
@@ -593,6 +1223,7 @@ def check_c2pa_metadata(
             manifest_store,
             dict
         ):
+
             raise RuntimeError(
                 "C2PA Reader ha restituito "
                 "un manifest store non valido."
@@ -619,34 +1250,49 @@ def check_c2pa_metadata(
             manifests,
             dict
         ):
+
             manifests = {}
 
-        result["manifest_count"] = len(
+        result["active_manifest"] = (
+            active_manifest
+        )
+
+        result["manifests"] = (
             manifests
         )
 
-        result["manifests"] = manifests
-
-        # ----------------------------------------------------
-        # validation_status può trovarsi a livello
-        # manifest store.
-        # ----------------------------------------------------
-
-        store_validation_status = (
-            manifest_store.get(
-                "validation_status",
-                []
-            )
+        result["manifest_count"] = (
+            len(manifests)
         )
 
-        if not isinstance(
-            store_validation_status,
-            list
-        ):
-            store_validation_status = []
+        # ----------------------------------------------------
+        # DETECTED
+        # ----------------------------------------------------
+
+        result["detected"] = bool(
+            manifests
+            or
+            active_manifest
+        )
+
+        if not result["detected"]:
+
+            result["status"] = (
+                "not_detected"
+            )
+
+            log(
+                "C2PA: "
+                "detected=False | "
+                "valid=False | "
+                "trusted=False | "
+                "status=not_detected"
+            )
+
+            return result
 
         # ----------------------------------------------------
-        # Nessun active manifest
+        # Active manifest assente
         # ----------------------------------------------------
 
         if not active_manifest:
@@ -655,24 +1301,18 @@ def check_c2pa_metadata(
                 "manifest_not_active"
             )
 
-            result["validation_status"] = (
-                store_validation_status
-            )
-
-            result["validation_errors"] = (
-                _extract_validation_errors(
-                    store_validation_status
-                )
+            log(
+                "C2PA: "
+                "detected=True | "
+                "valid=False | "
+                "trusted=False | "
+                "status=manifest_not_active"
             )
 
             return result
 
-        result["active_manifest"] = (
-            active_manifest
-        )
-
         # ----------------------------------------------------
-        # Recuperiamo il manifest attivo
+        # Manifest attivo
         # ----------------------------------------------------
 
         manifest = manifests.get(
@@ -688,13 +1328,15 @@ def check_c2pa_metadata(
                 "active_manifest_missing"
             )
 
+            log(
+                "C2PA: "
+                "detected=True | "
+                "valid=False | "
+                "trusted=False | "
+                "status=active_manifest_missing"
+            )
+
             return result
-
-        # ----------------------------------------------------
-        # Manifest rilevato
-        # ----------------------------------------------------
-
-        result["detected"] = True
 
         result["claim_generator"] = (
             manifest.get(
@@ -745,120 +1387,519 @@ def check_c2pa_metadata(
             )
 
         # ----------------------------------------------------
-        # Validation status
-        #
-        # Preferiamo quello del manifest se presente,
-        # altrimenti quello del manifest store.
+        # validation_state
         # ----------------------------------------------------
 
-        manifest_validation_status = (
-            manifest.get(
-                "validation_status"
+        validation_state = (
+            manifest_store.get(
+                "validation_state"
             )
         )
 
-        if isinstance(
-            manifest_validation_status,
-            list
-        ):
+        result["validation_state"] = (
+            validation_state
+        )
 
-            validation_status = (
-                manifest_validation_status
+        # ----------------------------------------------------
+        # validation_status
+        #
+        # Legacy / aggregate C2PA output.
+        # ----------------------------------------------------
+
+        validation_status = (
+            manifest_store.get(
+                "validation_status",
+                []
             )
-
-        else:
-
-            validation_status = (
-                store_validation_status
-            )
+        )
 
         result["validation_status"] = (
             validation_status
         )
 
         # ----------------------------------------------------
-        # Validation errors
+        # validation_results
+        #
+        # Output moderno:
+        #
+        # {
+        #   "activeManifest": {
+        #       "success": [],
+        #       "informational": [],
+        #       "failure": []
+        #   },
+        #   "ingredientDeltas": [...]
+        # }
+        # ----------------------------------------------------
+
+        validation_results = (
+            manifest_store.get(
+                "validation_results"
+            )
+        )
+
+        result["validation_results"] = (
+            validation_results
+        )
+
+        # ----------------------------------------------------
+        # Active manifest validation
+        # ----------------------------------------------------
+
+        active_validation = None
+
+        if isinstance(
+            validation_results,
+            dict
+        ):
+
+            active_validation = (
+                validation_results.get(
+                    "activeManifest"
+                )
+            )
+
+        if active_validation is not None:
+
+            active_statuses = (
+                active_validation
+            )
+
+        else:
+
+            active_statuses = (
+                validation_status
+            )
+
+        # ----------------------------------------------------
+        # Errori reali
         # ----------------------------------------------------
 
         validation_errors = (
             _extract_validation_errors(
-                validation_status
+                active_statuses
             )
         )
+
+        # ----------------------------------------------------
+        # signingCredential.untrusted
+        # ----------------------------------------------------
+
+        untrusted_credentials = (
+            _extract_untrusted_credentials(
+                active_statuses
+            )
+        )
+
+        # ----------------------------------------------------
+        # Success codes
+        # ----------------------------------------------------
+
+        success_codes = (
+            _extract_success_codes(
+                active_statuses
+            )
+        )
+
+        # ----------------------------------------------------
+        # Ingredient deltas
+        #
+        # Un failure reale in un ingrediente viene mantenuto
+        # come failure della provenance chain.
+        # ----------------------------------------------------
+
+        ingredient_delta_errors = []
+
+        ingredient_delta_untrusted = []
+
+        if isinstance(
+            validation_results,
+            dict
+        ):
+
+            ingredient_deltas = (
+                validation_results.get(
+                    "ingredientDeltas",
+                    []
+                )
+            )
+
+            if isinstance(
+                ingredient_deltas,
+                list
+            ):
+
+                for delta in ingredient_deltas:
+
+                    if not isinstance(
+                        delta,
+                        dict
+                    ):
+
+                        continue
+
+                    delta_status = (
+                        delta.get(
+                            "validationDeltas"
+                        )
+                    )
+
+                    if not delta_status:
+
+                        continue
+
+                    ingredient_delta_errors.extend(
+                        _extract_validation_errors(
+                            delta_status
+                        )
+                    )
+
+                    ingredient_delta_untrusted.extend(
+                        _extract_untrusted_credentials(
+                            delta_status
+                        )
+                    )
+
+        validation_errors.extend(
+            ingredient_delta_errors
+        )
+
+        untrusted_credentials.extend(
+            ingredient_delta_untrusted
+        )
+
+        # ----------------------------------------------------
+        # Deduplica errori
+        # ----------------------------------------------------
+
+        unique_errors = []
+
+        seen_errors = set()
+
+        for error in validation_errors:
+
+            code = error.get(
+                "code"
+            )
+
+            explanation = error.get(
+                "explanation"
+            )
+
+            key = (
+                str(code),
+                str(explanation)
+            )
+
+            if key in seen_errors:
+
+                continue
+
+            seen_errors.add(
+                key
+            )
+
+            unique_errors.append(
+                error
+            )
+
+        validation_errors = (
+            unique_errors
+        )
+
+        # ----------------------------------------------------
+        # Deduplica untrusted
+        # ----------------------------------------------------
+
+        unique_untrusted = []
+
+        seen_untrusted = set()
+
+        for item in untrusted_credentials:
+
+            code = item.get(
+                "code"
+            )
+
+            explanation = item.get(
+                "explanation"
+            )
+
+            key = (
+                str(code),
+                str(explanation)
+            )
+
+            if key in seen_untrusted:
+
+                continue
+
+            seen_untrusted.add(
+                key
+            )
+
+            unique_untrusted.append(
+                item
+            )
+
+        untrusted_credentials = (
+            unique_untrusted
+        )
+
+        # ----------------------------------------------------
+        # Salvataggio risultati
+        # ----------------------------------------------------
 
         result["validation_errors"] = (
             validation_errors
         )
 
+        result["untrusted_credentials"] = (
+            untrusted_credentials
+        )
+
+        result["success_codes"] = (
+            success_codes
+        )
+
         # ----------------------------------------------------
-        # Validità tecnica
+        # TRUST
+        #
+        # Trusted solo se:
+        #
+        # 1. signingCredential.trusted presente
+        #    oppure validation_state=Trusted
+        #
+        # 2. non ci sono failure reali.
         # ----------------------------------------------------
 
-        if validation_errors:
+        trusted_from_success = (
+            "signingCredential.trusted"
+            in success_codes
+        )
 
-            result["valid"] = False
+        trusted_from_state = (
+            str(
+                validation_state
+            ).lower()
+            == "trusted"
+        )
 
-            result["status"] = (
-                "validation_failed"
+        result["trusted"] = bool(
+            (
+                trusted_from_success
+                or
+                trusted_from_state
             )
+            and
+            not validation_errors
+        )
+
+        # ----------------------------------------------------
+        # VALID
+        #
+        # IMPORTANTE:
+        #
+        # validation_state può essere "Invalid" quando
+        # l'unico failure è signingCredential.untrusted.
+        #
+        # Per il nostro analyzer:
+        #
+        #   signingCredential.untrusted
+        #
+        # non viene considerato una corruzione della firma.
+        #
+        # valid=True significa quindi che non sono stati
+        # rilevati failure REALI di integrità/validazione.
+        # ----------------------------------------------------
+
+        state_lower = str(
+            validation_state
+        ).lower()
+
+        # ----------------------------------------------------
+        # Trusted
+        # ----------------------------------------------------
+
+        if result["trusted"]:
+
+            result["valid"] = True
+
+        # ----------------------------------------------------
+        # validation_state = Valid
+        # ----------------------------------------------------
+
+        elif (
+            state_lower == "valid"
+            and
+            not validation_errors
+        ):
+
+            result["valid"] = True
+
+        # ----------------------------------------------------
+        # validation_state = Invalid
+        #
+        # Se l'unico problema è untrusted:
+        #
+        #   valid=True
+        #   trusted=False
+        #
+        # altrimenti:
+        #
+        #   valid=False
+        # ----------------------------------------------------
+
+        elif state_lower == "invalid":
+
+            result["valid"] = bool(
+                (
+                    len(
+                        validation_errors
+                    ) == 0
+                )
+                and
+                (
+                    len(
+                        untrusted_credentials
+                    ) > 0
+                )
+                and
+                (
+                    "claimSignature.validated"
+                    in success_codes
+                )
+            )
+
+        # ----------------------------------------------------
+        # Fallback per SDK/versioni che non espongono
+        # validation_state.
+        # ----------------------------------------------------
 
         else:
 
-            result["valid"] = True
+            claim_signature_validated = (
+                "claimSignature.validated"
+                in success_codes
+            )
+
+            result["valid"] = bool(
+                claim_signature_validated
+                and
+                not validation_errors
+            )
+
+        # ----------------------------------------------------
+        # STATUS
+        # ----------------------------------------------------
+
+        if result["trusted"]:
+
+            result["status"] = (
+                "trusted"
+            )
+
+        elif (
+            result["valid"]
+            and
+            untrusted_credentials
+        ):
 
             result["status"] = (
                 "valid_untrusted"
             )
 
-        # ----------------------------------------------------
-        # TRUST
-        #
-        # Non impostiamo trusted=True automaticamente.
-        #
-        # La verifica della catena di trust richiede
-        # trust anchors/configurazione esplicita.
-        # ----------------------------------------------------
+        elif (
+            result["valid"]
+        ):
 
-        result["trusted"] = False
+            result["status"] = (
+                "valid"
+            )
+
+        elif validation_errors:
+
+            result["status"] = (
+                "invalid"
+            )
+
+        else:
+
+            result["status"] = (
+                "detected_unverified"
+            )
+
+        # ----------------------------------------------------
+        # LOGGING
+        # ----------------------------------------------------
 
         log(
-            "C2PA validation: "
-            f"detected={result['detected']} "
-            f"valid={result['valid']} "
-            f"trusted={result['trusted']} "
-            f"status={result['status']} "
-            f"manifests={result['manifest_count']}"
+            "C2PA summary: "
+            f"detected={result['detected']} | "
+            f"valid={result['valid']} | "
+            f"trusted={result['trusted']} | "
+            f"status={result['status']} | "
+            f"validation_state={validation_state}"
         )
+
+        if untrusted_credentials:
+
+            log(
+                "C2PA signer: "
+                "PRESENT BUT NOT TRUSTED"
+            )
+
+            log(
+                "C2PA untrusted details: "
+                f"{untrusted_credentials}"
+            )
 
         if validation_errors:
 
             log(
-                "C2PA validation errors: "
+                "C2PA integrity/validation: "
+                "INVALID"
+            )
+
+            log(
+                "C2PA real validation failures: "
                 f"{validation_errors}"
+            )
+
+        if result["trusted"]:
+
+            log(
+                "C2PA signer: "
+                "TRUSTED"
             )
 
         return result
 
     except Exception as e:
 
-        result["status"] = "error"
+        result["status"] = (
+            "error"
+        )
 
-        result["error"] = str(e)
+        result["error"] = (
+            str(e)
+        )
 
         result["valid"] = False
 
         result["trusted"] = False
 
         log(
-            f"C2PA engine error "
-            f"({mime_type}): {e}"
+            "C2PA engine ERROR: "
+            f"mime={mime_type} "
+            f"error={e}"
         )
 
         return result
 
 
 # ============================================================
-# 9. JPEG METADATA ENGINE
+# 11. JPEG METADATA ENGINE
 # ============================================================
 
 def analyze_jpeg_metadata(
@@ -867,26 +1908,35 @@ def analyze_jpeg_metadata(
 
     result = {
 
-        "format": "jpeg",
+        "format":
+            "jpeg",
 
-        "exif_present": False,
+        "exif_present":
+            False,
 
-        "xmp_present": False,
+        "xmp_present":
+            False,
 
-        "iptc_present": False,
+        "iptc_present":
+            False,
 
-        "software": None,
+        "software":
+            None,
 
-        "creator": None,
+        "creator":
+            None,
 
-        "description": None,
+        "description":
+            None,
 
-        "raw_markers": []
+        "raw_markers":
+            []
     }
 
     if not file_bytes.startswith(
         b"\xff\xd8\xff"
     ):
+
         return result
 
     position = 2
@@ -907,16 +1957,21 @@ def analyze_jpeg_metadata(
 
         position += 2
 
+        # ----------------------------------------------------
         # SOI / EOI / restart markers
+        # ----------------------------------------------------
+
         if marker in (
             0xD8,
             0xD9
         ):
+
             continue
 
         if position + 2 > len(
             file_bytes
         ):
+
             break
 
         segment_length = struct.unpack(
@@ -928,6 +1983,7 @@ def analyze_jpeg_metadata(
         )[0]
 
         if segment_length < 2:
+
             break
 
         segment_end = (
@@ -938,6 +1994,7 @@ def analyze_jpeg_metadata(
         if segment_end > len(
             file_bytes
         ):
+
             break
 
         segment = file_bytes[
@@ -954,25 +2011,39 @@ def analyze_jpeg_metadata(
             if segment.startswith(
                 b"Exif\x00\x00"
             ):
-                result["exif_present"] = True
+
+                result[
+                    "exif_present"
+                ] = True
 
             if (
                 b"http://ns.adobe.com/xap/"
                 in segment
             ):
-                result["xmp_present"] = True
+
+                result[
+                    "xmp_present"
+                ] = True
 
             if b"<x:xmpmeta" in segment:
-                result["xmp_present"] = True
+
+                result[
+                    "xmp_present"
+                ] = True
 
         # ----------------------------------------------------
         # APP13
         # ----------------------------------------------------
 
         if marker == 0xED:
-            result["iptc_present"] = True
 
-        result["raw_markers"].append(
+            result[
+                "iptc_present"
+            ] = True
+
+        result[
+            "raw_markers"
+        ].append(
             hex(marker)
         )
 
@@ -982,7 +2053,7 @@ def analyze_jpeg_metadata(
 
 
 # ============================================================
-# 10. PNG METADATA ENGINE
+# 12. PNG METADATA ENGINE
 # ============================================================
 
 def analyze_png_metadata(
@@ -991,17 +2062,23 @@ def analyze_png_metadata(
 
     result = {
 
-        "format": "png",
+        "format":
+            "png",
 
-        "text_chunks": [],
+        "text_chunks":
+            [],
 
-        "xmp_present": False,
+        "xmp_present":
+            False,
 
-        "software": None,
+        "software":
+            None,
 
-        "creator": None,
+        "creator":
+            None,
 
-        "description": None
+        "description":
+            None
     }
 
     signature = (
@@ -1011,6 +2088,7 @@ def analyze_png_metadata(
     if not file_bytes.startswith(
         signature
     ):
+
         return result
 
     position = 8
@@ -1039,12 +2117,14 @@ def analyze_png_metadata(
             )
 
             data_end = (
-                data_start + length
+                data_start
+                + length
             )
 
             if data_end > len(
                 file_bytes
             ):
+
                 break
 
             data = file_bytes[
@@ -1080,8 +2160,11 @@ def analyze_png_metadata(
                         "text_chunks"
                     ].append(
                         {
-                            "chunk": chunk_name,
-                            "text": text[:1000]
+                            "chunk":
+                                chunk_name,
+
+                            "text":
+                                text[:1000]
                         }
                     )
 
@@ -1093,7 +2176,8 @@ def analyze_png_metadata(
                     if (
                         "xmp" in text_lower
                         or
-                        "xmpmeta" in text_lower
+                        "xmpmeta"
+                        in text_lower
                     ):
 
                         result[
@@ -1102,7 +2186,8 @@ def analyze_png_metadata(
 
                     # Software
                     if (
-                        "software" in text_lower
+                        "software"
+                        in text_lower
                     ):
 
                         if not result[
@@ -1115,7 +2200,8 @@ def analyze_png_metadata(
 
                     # Creator
                     if (
-                        "creator" in text_lower
+                        "creator"
+                        in text_lower
                     ):
 
                         if not result[
@@ -1145,6 +2231,7 @@ def analyze_png_metadata(
             )
 
             if chunk_type == b"IEND":
+
                 break
 
         except Exception as e:
@@ -1159,7 +2246,7 @@ def analyze_png_metadata(
 
 
 # ============================================================
-# 11. GENERIC METADATA ENGINE
+# 13. GENERIC METADATA ENGINE
 # ============================================================
 
 def analyze_metadata(
@@ -1169,23 +2256,32 @@ def analyze_metadata(
 
     result = {
 
-        "available": True,
+        "available":
+            True,
 
-        "format": mime_type,
+        "format":
+            mime_type,
 
-        "exif_present": False,
+        "exif_present":
+            False,
 
-        "xmp_present": False,
+        "xmp_present":
+            False,
 
-        "iptc_present": False,
+        "iptc_present":
+            False,
 
-        "software": None,
+        "software":
+            None,
 
-        "creator": None,
+        "creator":
+            None,
 
-        "description": None,
+        "description":
+            None,
 
-        "signals": []
+        "signals":
+            []
     }
 
     if mime_type == "image/jpeg":
@@ -1276,7 +2372,7 @@ def analyze_metadata(
 
 
 # ============================================================
-# 12. WATERMARK ENGINE
+# 14. WATERMARK ENGINE
 # ============================================================
 
 def check_watermark(
@@ -1293,20 +2389,26 @@ def check_watermark(
 
     result = {
 
-        "available": False,
+        "available":
+            False,
 
-        "detected": None,
+        "detected":
+            None,
 
-        "status": "not_implemented",
+        "status":
+            "not_implemented",
 
-        "method": None,
+        "method":
+            None,
 
-        "signals": [],
+        "signals":
+            [],
 
-        "detail": (
-            "Watermark detection visuale "
-            "non ancora collegato."
-        )
+        "detail":
+            (
+                "Watermark detection visuale "
+                "non ancora collegato."
+            )
     }
 
     if mime_type in (
@@ -1328,7 +2430,7 @@ def check_watermark(
 
 
 # ============================================================
-# 13. AI DETECTION ENGINE
+# 15. AI DETECTION ENGINE
 # ============================================================
 
 def run_ai_detection(
@@ -1347,23 +2449,32 @@ def run_ai_detection(
 
     result = {
 
-        "available": False,
+        "available":
+            False,
 
-        "provider": "sightengine",
+        "provider":
+            "sightengine",
 
-        "score": None,
+        "score":
+            None,
 
-        "confidence": None,
+        "confidence":
+            None,
 
-        "status": "not_available",
+        "status":
+            "not_available",
 
-        "model": "genai",
+        "model":
+            "genai",
 
-        "model_version": None,
+        "model_version":
+            None,
 
-        "signals": [],
+        "signals":
+            [],
 
-        "detail": None
+        "detail":
+            None
     }
 
     supported_mimes = (
@@ -1401,13 +2512,17 @@ def run_ai_detection(
 
         suffix_map = {
 
-            "image/jpeg": ".jpg",
+            "image/jpeg":
+                ".jpg",
 
-            "image/png": ".png",
+            "image/png":
+                ".png",
 
-            "image/webp": ".webp",
+            "image/webp":
+                ".webp",
 
-            "image/gif": ".gif"
+            "image/gif":
+                ".gif"
         }
 
         suffix = suffix_map.get(
@@ -1463,8 +2578,10 @@ def run_ai_detection(
             )
         )
 
-        ai_score = sightengine_result.get(
-            "ai_score"
+        ai_score = (
+            sightengine_result.get(
+                "ai_score"
+            )
         )
 
         if not available:
@@ -1522,7 +2639,9 @@ def run_ai_detection(
 
         result["available"] = True
 
-        result["score"] = ai_score
+        result["score"] = (
+            ai_score
+        )
 
         result["status"] = (
             "success"
@@ -1554,7 +2673,9 @@ def run_ai_detection(
             "error"
         )
 
-        result["detail"] = str(e)
+        result["detail"] = (
+            str(e)
+        )
 
         return result
 
@@ -1574,7 +2695,7 @@ def run_ai_detection(
 
 
 # ============================================================
-# 14. EVIDENCE ENGINE
+# 16. EVIDENCE ENGINE
 # ============================================================
 
 def build_evidence(
@@ -1597,23 +2718,46 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "c2pa",
+                "type":
+                    "c2pa",
 
-                "result": "present",
+                "result":
+                    "present",
 
-                "status": c2pa_result.get(
-                    "status"
-                ),
+                "status":
+                    c2pa_result.get(
+                        "status"
+                    ),
 
-                "valid": c2pa_result.get(
-                    "valid"
-                ),
+                "valid":
+                    c2pa_result.get(
+                        "valid"
+                    ),
 
-                "trusted": c2pa_result.get(
-                    "trusted"
-                ),
+                "trusted":
+                    c2pa_result.get(
+                        "trusted"
+                    ),
 
-                "confidence": 1.0
+                "validation_state":
+                    c2pa_result.get(
+                        "validation_state"
+                    ),
+
+                "untrusted_credentials":
+                    c2pa_result.get(
+                        "untrusted_credentials",
+                        []
+                    ),
+
+                "validation_errors":
+                    c2pa_result.get(
+                        "validation_errors",
+                        []
+                    ),
+
+                "confidence":
+                    1.0
             }
         )
 
@@ -1621,19 +2765,25 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "c2pa",
+                "type":
+                    "c2pa",
 
-                "result": "not_detected",
+                "result":
+                    "not_detected",
 
-                "status": c2pa_result.get(
-                    "status"
-                ),
+                "status":
+                    c2pa_result.get(
+                        "status"
+                    ),
 
-                "valid": False,
+                "valid":
+                    False,
 
-                "trusted": False,
+                "trusted":
+                    False,
 
-                "confidence": None
+                "confidence":
+                    None
             }
         )
 
@@ -1652,11 +2802,14 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "metadata",
+                "type":
+                    "metadata",
 
-                "result": signal,
+                "result":
+                    signal,
 
-                "confidence": None
+                "confidence":
+                    None
             }
         )
 
@@ -1670,25 +2823,31 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "ai_detection",
+                "type":
+                    "ai_detection",
 
-                "result": "available",
+                "result":
+                    "available",
 
-                "score": ai_result.get(
-                    "score"
-                ),
+                "score":
+                    ai_result.get(
+                        "score"
+                    ),
 
-                "confidence": ai_result.get(
-                    "confidence"
-                ),
+                "confidence":
+                    ai_result.get(
+                        "confidence"
+                    ),
 
-                "provider": ai_result.get(
-                    "provider"
-                ),
+                "provider":
+                    ai_result.get(
+                        "provider"
+                    ),
 
-                "status": ai_result.get(
-                    "status"
-                )
+                "status":
+                    ai_result.get(
+                        "status"
+                    )
             }
         )
 
@@ -1696,15 +2855,19 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "ai_detection",
+                "type":
+                    "ai_detection",
 
-                "result": "unavailable",
+                "result":
+                    "unavailable",
 
-                "status": ai_result.get(
-                    "status"
-                ),
+                "status":
+                    ai_result.get(
+                        "status"
+                    ),
 
-                "confidence": None
+                "confidence":
+                    None
             }
         )
 
@@ -1718,15 +2881,18 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "watermark",
+                "type":
+                    "watermark",
 
-                "result": watermark_result.get(
-                    "status"
-                ),
+                "result":
+                    watermark_result.get(
+                        "status"
+                    ),
 
-                "detected": watermark_result.get(
-                    "detected"
-                )
+                "detected":
+                    watermark_result.get(
+                        "detected"
+                    )
             }
         )
 
@@ -1734,13 +2900,16 @@ def build_evidence(
 
         signals.append(
             {
-                "type": "watermark",
+                "type":
+                    "watermark",
 
-                "result": "unavailable",
+                "result":
+                    "unavailable",
 
-                "status": watermark_result.get(
-                    "status"
-                )
+                "status":
+                    watermark_result.get(
+                        "status"
+                    )
             }
         )
 
@@ -1750,28 +2919,31 @@ def build_evidence(
 
     signals.append(
         {
-            "type": "file_integrity",
+            "type":
+                "file_integrity",
 
-            "result": "sha256_calculated",
+            "result":
+                "sha256_calculated",
 
-            "sha256": file_analysis.get(
-                "sha256"
-            )
+            "sha256":
+                file_analysis.get(
+                    "sha256"
+                )
         }
     )
 
     return {
 
-        "signal_count": len(
-            signals
-        ),
+        "signal_count":
+            len(signals),
 
-        "signals": signals
+        "signals":
+            signals
     }
 
 
 # ============================================================
-# 15. RISK ENGINE
+# 17. RISK ENGINE
 # ============================================================
 
 def calculate_risk(
@@ -1809,7 +2981,14 @@ def calculate_risk(
         "detected"
     ):
 
-        # Nessun punto se il manifest è presente.
+        # ----------------------------------------------------
+        # Manifest presente.
+        #
+        # Non aggiungiamo automaticamente rischio.
+        # Lo status valid/trusted viene conservato nei
+        # dettagli e nella compliance.
+        # ----------------------------------------------------
+
         pass
 
     else:
@@ -1876,7 +3055,9 @@ def calculate_risk(
     if software:
 
         software_lower = (
-            str(software).lower()
+            str(
+                software
+            ).lower()
         )
 
         ai_software_terms = [
@@ -1946,16 +3127,19 @@ def calculate_risk(
 
     return {
 
-        "score": risk_points,
+        "score":
+            risk_points,
 
-        "level": risk_level,
+        "level":
+            risk_level,
 
-        "reasons": reasons
+        "reasons":
+            reasons
     }
 
 
 # ============================================================
-# 16. COMPLIANCE ENGINE
+# 18. COMPLIANCE ENGINE
 # ============================================================
 
 def evaluate_compliance(
@@ -1965,28 +3149,40 @@ def evaluate_compliance(
 ) -> dict:
 
     """
-    ATTENZIONE:
+    Compliance tecnica rispetto alle regole implementate.
 
-    Questo non è un parere legale.
+    NON è un parere legale.
 
-    Valuta esclusivamente le evidenze tecniche
-    secondo le regole implementate.
+    Stati C2PA:
 
-    Regola attuale:
+        not_detected
+            Nessun manifest.
 
-        C2PA presente
+        valid_untrusted
+            Manifest tecnicamente valido ma signer
+            non presente nella trust list.
+
+        trusted
+            Manifest valido e signer trusted.
+
+        invalid
+            Manifest con failure reali.
+
+    Policy attuale:
+
+        C2PA trusted
         +
-        nessuna evidenza AI >= 0.80
+        AI score < 0.80
         =
         compliant
 
-    C2PA assente
-        =
-        non_compliant
+    C2PA valid_untrusted:
+        non viene classificato come "invalid",
+        ma non viene promosso automaticamente
+        a "compliant".
 
-    AI score >= 0.80
-        =
-        non_compliant
+    signingCredential.untrusted:
+        non equivale a firma/hash corrotti.
     """
 
     c2pa_detected = bool(
@@ -2007,15 +3203,58 @@ def evaluate_compliance(
         )
     )
 
+    c2pa_status = (
+        c2pa_result.get(
+            "status"
+        )
+    )
+
     ai_available = bool(
         ai_result.get(
             "available"
         )
     )
 
-    ai_score = ai_result.get(
-        "score"
+    ai_score = (
+        ai_result.get(
+            "score"
+        )
     )
+
+    evidence = {
+
+        "c2pa_detected":
+            c2pa_detected,
+
+        "c2pa_valid":
+            c2pa_valid,
+
+        "c2pa_trusted":
+            c2pa_trusted,
+
+        "c2pa_status":
+            c2pa_status,
+
+        "c2pa_validation_state":
+            c2pa_result.get(
+                "validation_state"
+            ),
+
+        "c2pa_untrusted_credentials":
+            c2pa_result.get(
+                "untrusted_credentials",
+                []
+            ),
+
+        "c2pa_validation_errors":
+            c2pa_result.get(
+                "validation_errors",
+                []
+            ),
+
+        "ai_score":
+            ai_score
+    }
 
     # --------------------------------------------------------
     # AI score molto alto
@@ -2034,43 +3273,123 @@ def evaluate_compliance(
 
         return {
 
-            "status": "non_compliant",
+            "status":
+                "non_compliant",
 
-            "reason": (
-                "Il motore AI detection "
-                "ha rilevato un'elevata "
-                "probabilità di contenuto AI."
-            ),
+            "reason":
+                (
+                    "Il motore AI detection "
+                    "ha rilevato un'elevata "
+                    "probabilità di contenuto AI."
+                ),
 
-            "evidence": {
-                "c2pa_detected": c2pa_detected,
-                "c2pa_valid": c2pa_valid,
-                "c2pa_trusted": c2pa_trusted,
-                "ai_score": ai_score
-            }
+            "evidence":
+                evidence
         }
 
     # --------------------------------------------------------
-    # C2PA presente
+    # C2PA realmente invalido
+    # --------------------------------------------------------
+
+    if (
+        c2pa_detected
+        and
+        not c2pa_valid
+        and
+        c2pa_status == "invalid"
+    ):
+
+        return {
+
+            "status":
+                "non_compliant",
+
+            "reason":
+                (
+                    "Manifest C2PA presente ma "
+                    "la validazione ha rilevato "
+                    "failure reali di integrità "
+                    "o validazione."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # --------------------------------------------------------
+    # C2PA valido ma signer non trusted
+    # --------------------------------------------------------
+
+    if (
+        c2pa_detected
+        and
+        c2pa_valid
+        and
+        not c2pa_trusted
+        and
+        c2pa_status == "valid_untrusted"
+    ):
+
+        return {
+
+            "status":
+                "non_compliant",
+
+            "reason":
+                (
+                    "Manifest C2PA tecnicamente "
+                    "valido, ma signing credential "
+                    "non trusted dalla trust list "
+                    "C2PA configurata."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # --------------------------------------------------------
+    # C2PA trusted
+    # --------------------------------------------------------
+
+    if c2pa_trusted:
+
+        return {
+
+            "status":
+                "compliant",
+
+            "reason":
+                (
+                    "Manifest C2PA valido e "
+                    "signing credential trusted "
+                    "dalla trust list C2PA."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # --------------------------------------------------------
+    # C2PA rilevato ma stato non sufficiente
     # --------------------------------------------------------
 
     if c2pa_detected:
 
         return {
 
-            "status": "compliant",
+            "status":
+                "non_compliant",
 
-            "reason": (
-                "Manifest C2PA rilevato. "
-                "Provenance tecnica disponibile."
-            ),
+            "reason":
+                (
+                    "Manifest C2PA rilevato ma "
+                    "non è stato possibile "
+                    "dimostrare validità e trust "
+                    "sufficienti."
+                ),
 
-            "evidence": {
-                "c2pa_detected": c2pa_detected,
-                "c2pa_valid": c2pa_valid,
-                "c2pa_trusted": c2pa_trusted,
-                "ai_score": ai_score
-            }
+            "evidence":
+                evidence
         }
 
     # --------------------------------------------------------
@@ -2079,23 +3398,21 @@ def evaluate_compliance(
 
     return {
 
-        "status": "non_compliant",
+        "status":
+            "non_compliant",
 
-        "reason": (
-            "Nessun manifest C2PA rilevato."
-        ),
+        "reason":
+            (
+                "Nessun manifest C2PA rilevato."
+            ),
 
-        "evidence": {
-            "c2pa_detected": False,
-            "c2pa_valid": False,
-            "c2pa_trusted": False,
-            "ai_score": ai_score
-        }
+        "evidence":
+            evidence
     }
 
 
 # ============================================================
-# 17. FIXER ENGINE
+# 19. FIXER ENGINE
 # ============================================================
 
 def apply_c2pa_fix(
@@ -2104,6 +3421,7 @@ def apply_c2pa_fix(
     mime_type: str,
     file_name: str
 ):
+
     """
     Placeholder intenzionale.
 
@@ -2135,7 +3453,7 @@ def apply_c2pa_fix(
 
 
 # ============================================================
-# 18. UPLOAD FIXER
+# 20. UPLOAD FIXER
 # ============================================================
 
 def upload_fixed_file(
@@ -2147,8 +3465,14 @@ def upload_fixed_file(
 
     safe_name = (
         file_name
-        .replace("/", "_")
-        .replace("\\", "_")
+        .replace(
+            "/",
+            "_"
+        )
+        .replace(
+            "\\",
+            "_"
+        )
     )
 
     storage_path = (
@@ -2165,8 +3489,11 @@ def upload_fixed_file(
                 storage_path,
                 file_bytes,
                 {
-                    "content-type": mime_type,
-                    "upsert": "true"
+                    "content-type":
+                        mime_type,
+
+                    "upsert":
+                        "true"
                 }
             )
         )
@@ -2188,7 +3515,7 @@ def upload_fixed_file(
 
 
 # ============================================================
-# 19. DATABASE UPDATE
+# 21. DATABASE UPDATE
 # ============================================================
 
 def update_audit(
@@ -2239,7 +3566,7 @@ def update_audit(
 
 
 # ============================================================
-# 20. AUDIT ERROR
+# 22. AUDIT ERROR
 # ============================================================
 
 def mark_audit_error(
@@ -2250,13 +3577,17 @@ def mark_audit_error(
 
     details = {
 
-        "worker": WORKER_NAME,
+        "worker":
+            WORKER_NAME,
 
-        "engine_version": ENGINE_VERSION,
+        "engine_version":
+            ENGINE_VERSION,
 
-        "status": "error",
+        "status":
+            "error",
 
-        "error": error_message
+        "error":
+            error_message
     }
 
     if extra_details:
@@ -2278,7 +3609,7 @@ def mark_audit_error(
 
 
 # ============================================================
-# 21. SINGOLO AUDIT
+# 23. SINGOLO AUDIT
 # ============================================================
 
 def process_single_audit(
@@ -2361,14 +3692,19 @@ def process_single_audit(
 
         mark_audit_error(
             audit_id,
-            "Impossibile scaricare "
-            "il file da Supabase Storage",
+            (
+                "Impossibile scaricare "
+                "il file da Supabase Storage"
+            ),
             {
-                "reason": str(e),
+                "reason":
+                    str(e),
 
-                "file_url": file_url,
+                "file_url":
+                    file_url,
 
-                "bucket": MEDIA_BUCKET
+                "bucket":
+                    MEDIA_BUCKET
             }
         )
 
@@ -2432,24 +3768,32 @@ def process_single_audit(
     )
 
     log(
-        f"C2PA detected: "
-        f"{c2pa_detected}"
+        "C2PA summary: "
+        f"detected={c2pa_result.get('detected')} | "
+        f"valid={c2pa_result.get('valid')} | "
+        f"trusted={c2pa_result.get('trusted')} | "
+        f"status={c2pa_result.get('status')} | "
+        f"validation_state="
+        f"{c2pa_result.get('validation_state')}"
     )
 
-    log(
-        f"C2PA valid: "
-        f"{c2pa_result.get('valid')}"
-    )
+    if c2pa_result.get(
+        "untrusted_credentials"
+    ):
 
-    log(
-        f"C2PA trusted: "
-        f"{c2pa_result.get('trusted')}"
-    )
+        log(
+            "C2PA signer status: "
+            "PRESENT BUT NOT TRUSTED"
+        )
 
-    log(
-        f"C2PA status: "
-        f"{c2pa_result.get('status')}"
-    )
+    if c2pa_result.get(
+        "validation_errors"
+    ):
+
+        log(
+            "C2PA integrity status: "
+            "INVALID"
+        )
 
     # --------------------------------------------------------
     # METADATA
@@ -2506,8 +3850,10 @@ def process_single_audit(
         mime_type
     )
 
-    ai_score = ai_result.get(
-        "score"
+    ai_score = (
+        ai_result.get(
+            "score"
+        )
     )
 
     log(
@@ -2592,6 +3938,11 @@ def process_single_audit(
     log(
         f"Compliance: "
         f"{compliance_status}"
+    )
+
+    log(
+        f"Compliance reason: "
+        f"{recommendation}"
     )
 
     # --------------------------------------------------------
@@ -2737,10 +4088,11 @@ def process_single_audit(
     )
 
     log(
-        f"C2PA: "
-        f"detected={c2pa_detected} "
-        f"valid={c2pa_result.get('valid')} "
-        f"trusted={c2pa_result.get('trusted')}"
+        "C2PA: "
+        f"detected={c2pa_result.get('detected')} | "
+        f"valid={c2pa_result.get('valid')} | "
+        f"trusted={c2pa_result.get('trusted')} | "
+        f"status={c2pa_result.get('status')}"
     )
 
     log(
@@ -2763,7 +4115,7 @@ def process_single_audit(
 
 
 # ============================================================
-# 22. PENDING AUDITS
+# 24. PENDING AUDITS
 # ============================================================
 
 def process_pending_audits():
@@ -2825,10 +4177,13 @@ def process_pending_audits():
 
                     mark_audit_error(
                         audit_id,
-                        "Errore interno "
-                        "durante l'elaborazione",
+                        (
+                            "Errore interno "
+                            "durante l'elaborazione"
+                        ),
                         {
-                            "reason": str(e)
+                            "reason":
+                                str(e)
                         }
                     )
 
@@ -2841,7 +4196,7 @@ def process_pending_audits():
 
 
 # ============================================================
-# 23. WORKER LOOP
+# 25. WORKER LOOP
 # ============================================================
 
 def audit_loop():
@@ -2875,6 +4230,16 @@ def audit_loop():
         f"{MAX_FILE_SIZE_MB} MB"
     )
 
+    log(
+        "C2PA trust verification: "
+        f"{C2PA_CONTEXT is not None}"
+    )
+
+    log(
+        "C2PA trust source: "
+        f"{C2PA_TRUST_SOURCE}"
+    )
+
     while True:
 
         log(
@@ -2897,7 +4262,7 @@ def audit_loop():
 
 
 # ============================================================
-# 24. STARTUP
+# 26. STARTUP
 # ============================================================
 
 if __name__ == "__main__":
@@ -2939,9 +4304,31 @@ if __name__ == "__main__":
         "============================================================"
     )
 
+    # --------------------------------------------------------
+    # C2PA
+    # --------------------------------------------------------
+
+    log(
+        "Initializing C2PA trust configuration..."
+    )
+
+    initialize_c2pa_context()
+
+    log(
+        "C2PA trust configuration ready."
+    )
+
+    # --------------------------------------------------------
+    # Worker
+    # --------------------------------------------------------
+
     threading.Thread(
         target=audit_loop,
         daemon=True
     ).start()
+
+    # --------------------------------------------------------
+    # Render HTTP server
+    # --------------------------------------------------------
 
     run_http_server()

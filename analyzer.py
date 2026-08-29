@@ -3139,10 +3139,6 @@ def calculate_risk(
 
 
 # ============================================================
-# 18. COMPLIANCE ENGINE
-# ============================================================
-
-# ============================================================
 # 18. COMPLIANCE ENGINE — ANALYZER 3.0
 # ============================================================
 
@@ -4287,23 +4283,43 @@ def process_single_audit(
         )
     )
 
-    compliance_status = (
-        compliance_result.get(
-            "status"
-        )
+compliance_status = (
+    compliance_result.get(
+        "status"
     )
+)
 
-    recommendation = (
-        compliance_result.get(
-            "reason"
-        )
+decision = (
+    compliance_result.get(
+        "decision"
     )
+)
+
+decision_basis = (
+    compliance_result.get(
+        "decision_basis"
+    )
+)
+
+recommendation = (
+    compliance_result.get(
+        "reason"
+    )
+)
 
     log(
         f"Compliance: "
         f"{compliance_status}"
     )
+log(
+    f"Decision: "
+    f"{decision}"
+)
 
+log(
+    f"Decision basis: "
+    f"{decision_basis}"
+)
     log(
         f"Compliance reason: "
         f"{recommendation}"
@@ -4376,7 +4392,11 @@ def process_single_audit(
 
         "compliance":
             compliance_result,
+"decision":
+    decision,
 
+"decision_basis":
+    decision_basis,
         "recommendation":
             recommendation,
 

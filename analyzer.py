@@ -3142,6 +3142,10 @@ def calculate_risk(
 # 18. COMPLIANCE ENGINE
 # ============================================================
 
+# ============================================================
+# 18. COMPLIANCE ENGINE — ANALYZER 3.0
+# ============================================================
+
 def evaluate_compliance(
     c2pa_result: dict,
     ai_result: dict,
@@ -3149,41 +3153,85 @@ def evaluate_compliance(
 ) -> dict:
 
     """
-    Compliance tecnica rispetto alle regole implementate.
+    Compliance decision engine — Analyzer 3.0.
 
-    NON è un parere legale.
+    OBIETTIVO:
+        Separare:
+            1. C2PA provenance evidence
+            2. AI detection signal
+            3. Technical decision
 
-    Stati C2PA:
+    IMPORTANTE:
+        Questo motore NON costituisce una certificazione legale
+        definitiva di conformità all'EU AI Act.
 
-        not_detected
-            Nessun manifest.
+        Il risultato rappresenta una valutazione tecnica
+        basata sulle evidenze disponibili al momento dell'audit.
 
-        valid_untrusted
-            Manifest tecnicamente valido ma signer
-            non presente nella trust list.
-
-        trusted
-            Manifest valido e signer trusted.
-
-        invalid
-            Manifest con failure reali.
-
-    Policy attuale:
+    PRINCIPI:
 
         C2PA trusted
-        +
-        AI score < 0.80
-        =
+            =
+        provenienza C2PA verificata
+
+        AI detector score
+            =
+        segnale probabilistico
+
+        AI score NON viene mai trattato da solo come prova
+        definitiva di contenuto AI.
+
+    STATI POSSIBILI:
+
         compliant
+            Evidenze tecniche sufficientemente coerenti
+            con la policy implementata.
 
-    C2PA valid_untrusted:
-        non viene classificato come "invalid",
-        ma non viene promosso automaticamente
-        a "compliant".
+        review_required
+            Evidenze incomplete, contrastanti o insufficienti
+            per una decisione automatica.
 
-    signingCredential.untrusted:
-        non equivale a firma/hash corrotti.
+        non_compliant
+            Failure tecnici reali o condizioni che violano
+            direttamente la policy tecnica implementata.
+
+    LOGICA 3.0:
+
+        1. C2PA invalid
+            -> non_compliant
+
+        2. C2PA valid_untrusted
+            -> review_required
+
+        3. C2PA trusted + AI >= 0.80
+            -> review_required
+
+        4. C2PA absent + AI >= 0.80
+            -> review_required
+
+        5. C2PA trusted + AI < 0.80
+            -> compliant
+
+        6. C2PA trusted + AI unavailable
+            -> review_required
+
+        7. C2PA absent + AI unavailable
+            -> review_required
+
+    NOTA NORMATIVA:
+
+        Article 50 AI Act distingue tra:
+            - machine-readable marking
+            - detectability
+            - disclosure/labeling in determinati casi
+
+        Pertanto il presente engine non considera un singolo
+        AI detector probabilistico come prova legale definitiva.
     """
+
+    # ========================================================
+    # NORMALIZZAZIONE INPUT
+    # ========================================================
 
     c2pa_detected = bool(
         c2pa_result.get(
@@ -3209,6 +3257,26 @@ def evaluate_compliance(
         )
     )
 
+    c2pa_validation_state = (
+        c2pa_result.get(
+            "validation_state"
+        )
+    )
+
+    c2pa_validation_errors = (
+        c2pa_result.get(
+            "validation_errors",
+            []
+        )
+    )
+
+    c2pa_untrusted_credentials = (
+        c2pa_result.get(
+            "untrusted_credentials",
+            []
+        )
+    )
+
     ai_available = bool(
         ai_result.get(
             "available"
@@ -3220,6 +3288,34 @@ def evaluate_compliance(
             "score"
         )
     )
+
+    # ========================================================
+    # AI SCORE CLASSIFICATION
+    # ========================================================
+
+    ai_high_signal = False
+    ai_medium_signal = False
+
+    if (
+        ai_available
+        and
+        isinstance(
+            ai_score,
+            (int, float)
+        )
+    ):
+
+        if ai_score >= 0.80:
+
+            ai_high_signal = True
+
+        elif ai_score >= 0.50:
+
+            ai_medium_signal = True
+
+    # ========================================================
+    # EVIDENCE OBJECT
+    # ========================================================
 
     evidence = {
 
@@ -3236,60 +3332,30 @@ def evaluate_compliance(
             c2pa_status,
 
         "c2pa_validation_state":
-            c2pa_result.get(
-                "validation_state"
-            ),
+            c2pa_validation_state,
 
         "c2pa_untrusted_credentials":
-            c2pa_result.get(
-                "untrusted_credentials",
-                []
-            ),
+            c2pa_untrusted_credentials,
 
         "c2pa_validation_errors":
-            c2pa_result.get(
-                "validation_errors",
-                []
-            ),
+            c2pa_validation_errors,
+
+        "ai_available":
+            ai_available,
 
         "ai_score":
-            ai_score
+            ai_score,
+
+        "ai_high_signal":
+            ai_high_signal,
+
+        "ai_medium_signal":
+            ai_medium_signal
     }
 
-    # --------------------------------------------------------
-    # AI score molto alto
-    # --------------------------------------------------------
-
-    if (
-        ai_available
-        and
-        isinstance(
-            ai_score,
-            (int, float)
-        )
-        and
-        ai_score >= 0.80
-    ):
-
-        return {
-
-            "status":
-                "non_compliant",
-
-            "reason":
-                (
-                    "Il motore AI detection "
-                    "ha rilevato un'elevata "
-                    "probabilità di contenuto AI."
-                ),
-
-            "evidence":
-                evidence
-        }
-
-    # --------------------------------------------------------
-    # C2PA realmente invalido
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. C2PA REALMENTE INVALIDO
+    # ========================================================
 
     if (
         c2pa_detected
@@ -3297,6 +3363,8 @@ def evaluate_compliance(
         not c2pa_valid
         and
         c2pa_status == "invalid"
+        and
+        c2pa_validation_errors
     ):
 
         return {
@@ -3304,21 +3372,26 @@ def evaluate_compliance(
             "status":
                 "non_compliant",
 
+            "decision":
+                "automatic_non_compliant",
+
+            "decision_basis":
+                "c2pa_integrity_failure",
+
             "reason":
                 (
-                    "Manifest C2PA presente ma "
-                    "la validazione ha rilevato "
-                    "failure reali di integrità "
-                    "o validazione."
+                    "Manifest C2PA presente ma la "
+                    "validazione ha rilevato failure "
+                    "reali di integrità o validazione."
                 ),
 
             "evidence":
                 evidence
         }
 
-    # --------------------------------------------------------
-    # C2PA valido ma signer non trusted
-    # --------------------------------------------------------
+    # ========================================================
+    # 2. C2PA VALID_UNTRUSTED
+    # ========================================================
 
     if (
         c2pa_detected
@@ -3333,83 +3406,374 @@ def evaluate_compliance(
         return {
 
             "status":
-                "non_compliant",
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "c2pa_valid_but_untrusted",
 
             "reason":
                 (
-                    "Manifest C2PA tecnicamente "
-                    "valido, ma signing credential "
-                    "non trusted dalla trust list "
-                    "C2PA configurata."
+                    "Manifest C2PA tecnicamente valido, "
+                    "ma il signing credential non è "
+                    "trusted dalla trust list configurata. "
+                    "Il certificato non trusted non viene "
+                    "considerato automaticamente come "
+                    "firma o hash corrotti."
                 ),
 
             "evidence":
                 evidence
         }
 
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. C2PA TRUSTED + AI SCORE ALTO
+    #
+    # CASO DEL TUO TEST:
+    #
     # C2PA trusted
-    # --------------------------------------------------------
+    # AI score 0.99
+    #
+    # NON:
+    #   non_compliant
+    #
+    # NON:
+    #   compliant
+    #
+    # MA:
+    #   review_required
+    # ========================================================
 
-    if c2pa_trusted:
+    if (
+        c2pa_trusted
+        and
+        ai_high_signal
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "trusted_c2pa_and_high_ai_signal",
+
+            "reason":
+                (
+                    "La provenienza C2PA è verificata "
+                    "e il signing credential è trusted, "
+                    "ma il detector AI rileva un forte "
+                    "segnale di contenuto generato o "
+                    "manipolato dall'AI. Le evidenze sono "
+                    "tecnicamente significative ma non "
+                    "sufficienti per un verdetto automatico "
+                    "di conformità o non conformità."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 4. NESSUN C2PA + AI SCORE ALTO
+    #
+    # Anche qui NON dichiariamo automaticamente
+    # non_compliant solo sulla base del detector.
+    # ========================================================
+
+    if (
+        not c2pa_detected
+        and
+        ai_high_signal
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "high_ai_signal_without_c2pa",
+
+            "reason":
+                (
+                    "Il detector AI rileva un forte "
+                    "segnale di contenuto generato "
+                    "o manipolato dall'AI, ma non è "
+                    "presente un manifest C2PA verificabile. "
+                    "Lo score AI è un segnale probabilistico "
+                    "e richiede una valutazione ulteriore "
+                    "prima di formulare un verdetto."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 5. C2PA TRUSTED + AI SCORE BASSO
+    #
+    # Evidenze tecniche coerenti.
+    # ========================================================
+
+    if (
+        c2pa_trusted
+        and
+        ai_available
+        and
+        isinstance(
+            ai_score,
+            (int, float)
+        )
+        and
+        ai_score < 0.50
+    ):
 
         return {
 
             "status":
                 "compliant",
 
+            "decision":
+                "automatic_compliant",
+
+            "decision_basis":
+                "trusted_c2pa_and_low_ai_signal",
+
             "reason":
                 (
-                    "Manifest C2PA valido e "
-                    "signing credential trusted "
-                    "dalla trust list C2PA."
+                    "Manifest C2PA valido e signing "
+                    "credential trusted. Il detector "
+                    "AI non rileva un forte segnale "
+                    "di contenuto generato dall'AI."
                 ),
 
             "evidence":
                 evidence
         }
 
-    # --------------------------------------------------------
-    # C2PA rilevato ma stato non sufficiente
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. C2PA TRUSTED + AI SCORE INTERMEDIO
+    #
+    # 0.50 <= score < 0.80
+    #
+    # Non è abbastanza forte per un non-compliant,
+    # ma nemmeno sufficientemente pulito per promuoverlo
+    # automaticamente.
+    # ========================================================
 
-    if c2pa_detected:
+    if (
+        c2pa_trusted
+        and
+        ai_medium_signal
+    ):
 
         return {
 
             "status":
-                "non_compliant",
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "trusted_c2pa_and_medium_ai_signal",
 
             "reason":
                 (
-                    "Manifest C2PA rilevato ma "
-                    "non è stato possibile "
-                    "dimostrare validità e trust "
-                    "sufficienti."
+                    "Manifest C2PA valido e trusted, "
+                    "ma il detector AI rileva un segnale "
+                    "intermedio di contenuto generato "
+                    "o manipolato dall'AI. È richiesta "
+                    "una verifica ulteriore."
                 ),
 
             "evidence":
                 evidence
         }
 
-    # --------------------------------------------------------
-    # Nessun C2PA
-    # --------------------------------------------------------
+    # ========================================================
+    # 7. C2PA TRUSTED + AI DETECTOR NON DISPONIBILE
+    #
+    # Non possiamo usare l'assenza del detector come
+    # prova di contenuto umano.
+    # ========================================================
+
+    if (
+        c2pa_trusted
+        and
+        not ai_available
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "trusted_c2pa_ai_detection_unavailable",
+
+            "reason":
+                (
+                    "Manifest C2PA valido e signing "
+                    "credential trusted, ma il detector "
+                    "AI non è disponibile. Le evidenze "
+                    "non sono sufficienti per una decisione "
+                    "automatica completa."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 8. C2PA ASSENTE + AI SCORE BASSO
+    #
+    # Nessun forte segnale AI, ma manca la provenienza
+    # C2PA. Non dichiariamo automaticamente compliant.
+    # ========================================================
+
+    if (
+        not c2pa_detected
+        and
+        ai_available
+        and
+        isinstance(
+            ai_score,
+            (int, float)
+        )
+        and
+        ai_score < 0.50
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "no_c2pa_low_ai_signal",
+
+            "reason":
+                (
+                    "Non è stato rilevato un manifest "
+                    "C2PA e il detector AI non rileva "
+                    "un forte segnale di contenuto AI. "
+                    "L'assenza di C2PA non costituisce "
+                    "da sola prova di contenuto umano "
+                    "o di conformità."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 9. C2PA ASSENTE + AI SCORE INTERMEDIO
+    # ========================================================
+
+    if (
+        not c2pa_detected
+        and
+        ai_medium_signal
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "no_c2pa_medium_ai_signal",
+
+            "reason":
+                (
+                    "Non è stato rilevato un manifest "
+                    "C2PA e il detector AI rileva un "
+                    "segnale intermedio. È richiesta "
+                    "una valutazione ulteriore."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 10. C2PA ASSENTE + AI DETECTOR NON DISPONIBILE
+    # ========================================================
+
+    if (
+        not c2pa_detected
+        and
+        not ai_available
+    ):
+
+        return {
+
+            "status":
+                "review_required",
+
+            "decision":
+                "manual_review",
+
+            "decision_basis":
+                "insufficient_technical_evidence",
+
+            "reason":
+                (
+                    "Non è stato rilevato un manifest "
+                    "C2PA e il detector AI non è disponibile. "
+                    "Le evidenze tecniche disponibili "
+                    "non sono sufficienti per una decisione "
+                    "automatica."
+                ),
+
+            "evidence":
+                evidence
+        }
+
+    # ========================================================
+    # 11. FALLBACK SICURO
+    # ========================================================
 
     return {
 
         "status":
-            "non_compliant",
+            "review_required",
+
+        "decision":
+            "manual_review",
+
+        "decision_basis":
+            "insufficient_or_ambiguous_evidence",
 
         "reason":
             (
-                "Nessun manifest C2PA rilevato."
+                "Le evidenze tecniche disponibili "
+                "non consentono una decisione "
+                "automatica sufficientemente affidabile."
             ),
 
         "evidence":
             evidence
     }
-
 
 # ============================================================
 # 19. FIXER ENGINE

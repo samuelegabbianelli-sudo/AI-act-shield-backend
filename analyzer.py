@@ -21,34 +21,34 @@ from ai_detector import analyze_image
 
 # ============================================================
 # AI ACT SHIELD
-# ANALYZER ENGINE 2.2
+# ANALYZER ENGINE 3.0
 #
 # Pipeline:
 #
 # Supabase audits
-#       ↓
+#       â†“
 # media-to-check
-#       ↓
+#       â†“
 # Analyzer
-#       ├── File engine
-#       ├── SHA-256
-#       ├── C2PA engine
-#       ├── Metadata engine
-#       ├── Watermark engine
-#       ├── AI detection engine
-#       ├── Evidence engine
-#       └── Risk engine
-#       ↓
+#       â”œâ”€â”€ File engine
+#       â”œâ”€â”€ SHA-256
+# ANALYZER ENGINE 3.0
+#       â”œâ”€â”€ Metadata engine
+#       â”œâ”€â”€ Watermark engine
+#       â”œâ”€â”€ AI detection engine
+#       â”œâ”€â”€ Evidence engine
+#       â””â”€â”€ Risk engine
+#       â†“
 # Supabase audits
-#       ↓
+#       â†“
 # Fixer AI-act shield
 #
 # IMPORTANT:
 # - Nessuno score AI viene inventato.
 # - Nessuna firma C2PA falsa viene generata.
-# - "compliant" indica conformità tecnica rispetto alle
+# - "compliant" indica conformitÃ  tecnica rispetto alle
 #   regole attualmente implementate, NON certificazione
-#   legale definitiva di conformità all'AI Act.
+#   legale definitiva di conformitÃ  all'AI Act.
 #
 # C2PA v2.2:
 #
@@ -56,8 +56,8 @@ from ai_detector import analyze_image
 #   Manifest C2PA rilevato.
 #
 # valid:
-#   Integrità/validazione tecnica del manifest considerata
-#   valida, anche se il certificato di firma non è trusted.
+#   IntegritÃ /validazione tecnica del manifest considerata
+#   valida, anche se il certificato di firma non Ã¨ trusted.
 #
 # trusted:
 #   Signing credential trusted rispetto alla trust list
@@ -65,7 +65,7 @@ from ai_detector import analyze_image
 #
 # signingCredential.untrusted:
 #   NON viene trattato come una firma/hash corrotta.
-#   Viene distinto da un failure reale di integrità.
+#   Viene distinto da un failure reale di integritÃ .
 #
 # Stati C2PA principali:
 #
@@ -83,7 +83,7 @@ from ai_detector import analyze_image
 #
 #   detected_unverified
 #       Manifest rilevato ma impossibile dimostrare
-#       sufficientemente validità/trust.
+#       sufficientemente validitÃ /trust.
 # ============================================================
 
 
@@ -91,7 +91,7 @@ from ai_detector import analyze_image
 # 1. CONFIGURAZIONE
 # ============================================================
 
-ENGINE_VERSION = "2.2"
+ENGINE_VERSION = "3.0"
 WORKER_NAME = "AI Act Shield"
 
 SUPABASE_URL = os.environ.get(
@@ -142,7 +142,7 @@ MAX_FILE_SIZE_BYTES = (
 # Fonte:
 # c2pa-org/conformance-public
 #
-# Può essere sovrascritta tramite Environment Variable.
+# PuÃ² essere sovrascritta tramite Environment Variable.
 C2PA_TRUST_LIST_URL = os.environ.get(
     "C2PA_TRUST_LIST_URL",
     "https://raw.githubusercontent.com/"
@@ -159,7 +159,7 @@ C2PA_TRUST_LIST_TIMEOUT_SECONDS = int(
 
 # Se presente, questo PEM ha precedenza sulla URL.
 #
-# Deve contenere uno o più certificati PEM:
+# Deve contenere uno o piÃ¹ certificati PEM:
 #
 # -----BEGIN CERTIFICATE-----
 # ...
@@ -279,7 +279,7 @@ def load_c2pa_trust_anchors() -> tuple[str, str]:
     if not pem:
 
         raise RuntimeError(
-            "La trust list C2PA è vuota."
+            "La trust list C2PA Ã¨ vuota."
         )
 
     if "BEGIN CERTIFICATE" not in pem:
@@ -321,7 +321,7 @@ def initialize_c2pa_context():
     #   mantiene attiva la verifica durante la lettura.
     #
     # remote_manifest_fetch:
-    #   mantiene la possibilità di recuperare manifest
+    #   mantiene la possibilitÃ  di recuperare manifest
     #   remoti referenziati dal contenuto.
     # --------------------------------------------------------
 
@@ -506,7 +506,7 @@ def normalize_storage_path(
     ).strip()
 
     # --------------------------------------------------------
-    # Path già relativo
+    # Path giÃ  relativo
     # --------------------------------------------------------
 
     if not value.startswith(
@@ -931,11 +931,11 @@ def _extract_validation_errors(
     IMPORTANTE:
 
     signingCredential.untrusted viene escluso
-    dagli errori di integrità.
+    dagli errori di integritÃ .
 
     Questo codice significa:
 
-        il certificato del signer non è trusted
+        il certificato del signer non Ã¨ trusted
 
     e NON significa automaticamente:
 
@@ -997,7 +997,7 @@ def _extract_validation_errors(
             continue
 
         # ----------------------------------------------------
-        # Compatibilità con formati legacy
+        # CompatibilitÃ  con formati legacy
         # ----------------------------------------------------
 
         if success is False:
@@ -1700,8 +1700,8 @@ def check_c2pa_metadata(
         #
         # IMPORTANTE:
         #
-        # validation_state può essere "Invalid" quando
-        # l'unico failure è signingCredential.untrusted.
+        # validation_state puÃ² essere "Invalid" quando
+        # l'unico failure Ã¨ signingCredential.untrusted.
         #
         # Per il nostro analyzer:
         #
@@ -1710,7 +1710,7 @@ def check_c2pa_metadata(
         # non viene considerato una corruzione della firma.
         #
         # valid=True significa quindi che non sono stati
-        # rilevati failure REALI di integrità/validazione.
+        # rilevati failure REALI di integritÃ /validazione.
         # ----------------------------------------------------
 
         state_lower = str(
@@ -1740,7 +1740,7 @@ def check_c2pa_metadata(
         # ----------------------------------------------------
         # validation_state = Invalid
         #
-        # Se l'unico problema è untrusted:
+        # Se l'unico problema Ã¨ untrusted:
         #
         #   valid=True
         #   trusted=False
@@ -2381,9 +2381,9 @@ def check_watermark(
 ) -> dict:
 
     """
-    Il detector visuale non è ancora collegato.
+    Il detector visuale non Ã¨ ancora collegato.
 
-    NON dichiariamo detected=False soltanto perché
+    NON dichiariamo detected=False soltanto perchÃ©
     non troviamo una stringa nei metadata.
     """
 
@@ -2958,7 +2958,7 @@ def calculate_risk(
 
     Non usa ML.
 
-    Non inventa probabilità.
+    Non inventa probabilitÃ .
 
     Punteggio:
         C2PA assente       +40
@@ -3022,7 +3022,7 @@ def calculate_risk(
 
                 reasons.append(
                     "AI detector indica "
-                    "alta probabilità di "
+                    "alta probabilitÃ  di "
                     "contenuto AI."
                 )
 
@@ -3139,7 +3139,7 @@ def calculate_risk(
 
 
 # ============================================================
-# 18. COMPLIANCE ENGINE — ANALYZER 3.0
+# 18. COMPLIANCE ENGINE â€” ANALYZER 3.0
 # ============================================================
 def evaluate_compliance(
     c2pa_result: dict,
@@ -3150,12 +3150,12 @@ def evaluate_compliance(
     AI ACT SHIELD - ANALYZER 3.0
 
     ATTENZIONE:
-    Questo non è un parere legale.
+    Questo non Ã¨ un parere legale.
 
     Il sistema valuta esclusivamente evidenze tecniche
     secondo le regole implementate nel motore.
 
-    PRIORITÀ DELLE EVIDENZE:
+    PRIORITÃ€ DELLE EVIDENZE:
 
     1. C2PA trusted
        -> COMPLIANT
@@ -3173,7 +3173,7 @@ def evaluate_compliance(
        -> NON_COMPLIANT
 
     IMPORTANTE:
-    Un AI score è un'indicazione probabilistica e non viene
+    Un AI score Ã¨ un'indicazione probabilistica e non viene
     trattato come prova definitiva.
 
     Un manifest C2PA viene considerato automaticamente
@@ -3241,9 +3241,9 @@ def evaluate_compliance(
     # 1. C2PA TRUSTED
     # ========================================================
     #
-    # Questa è la priorità massima.
+    # Questa Ã¨ la prioritÃ  massima.
     #
-    # Se il manifest è realmente trusted, un AI score elevato
+    # Se il manifest Ã¨ realmente trusted, un AI score elevato
     # NON deve sovrascrivere la provenance verificata.
     #
 
@@ -3259,7 +3259,7 @@ def evaluate_compliance(
                 "Manifest C2PA rilevato, "
                 "tecnicamente valido e trusted. "
                 "La provenance verificata ha "
-                "priorità rispetto al punteggio "
+                "prioritÃ  rispetto al punteggio "
                 "probabilistico del detector AI."
             ),
             "c2pa": {
@@ -3285,9 +3285,9 @@ def evaluate_compliance(
     # Non dichiariamo automaticamente compliant.
     #
     # Esiste una provenance tecnica, ma la catena di trust
-    # non è stata verificata.
+    # non Ã¨ stata verificata.
     #
-    # Questo è un caso da revisione manuale.
+    # Questo Ã¨ un caso da revisione manuale.
     #
 
     if (
@@ -3301,7 +3301,7 @@ def evaluate_compliance(
             "reason": (
                 "Manifest C2PA rilevato e tecnicamente "
                 "valido, ma la catena di trust non "
-                "risulta verificata. È richiesta "
+                "risulta verificata. Ãˆ richiesta "
                 "una revisione manuale."
             ),
             "c2pa": {
@@ -3346,7 +3346,7 @@ def evaluate_compliance(
                 "reason": (
                     "Manifest C2PA rilevato ma non valido "
                     "e il detector AI indica un'elevata "
-                    "probabilità di contenuto AI."
+                    "probabilitÃ  di contenuto AI."
                 ),
                 "c2pa": {
                     "detected": True,
@@ -3369,7 +3369,7 @@ def evaluate_compliance(
             "decision": "invalid_c2pa",
             "reason": (
                 "Manifest C2PA rilevato ma non valido. "
-                "La provenance non può essere considerata "
+                "La provenance non puÃ² essere considerata "
                 "affidabile senza una revisione manuale."
             ),
             "c2pa": {
@@ -3406,7 +3406,7 @@ def evaluate_compliance(
             "reason": (
                 "Nessun manifest C2PA verificabile "
                 "e il detector AI indica un'elevata "
-                "probabilità di contenuto AI."
+                "probabilitÃ  di contenuto AI."
             ),
             "c2pa": {
                 "detected": False,
@@ -3442,7 +3442,7 @@ def evaluate_compliance(
             "reason": (
                 "Nessun manifest C2PA verificabile "
                 "e il detector AI ha rilevato segnali "
-                "intermedi. Il risultato non è "
+                "intermedi. Il risultato non Ã¨ "
                 "sufficientemente determinante per "
                 "una decisione automatica."
             ),
@@ -3470,12 +3470,12 @@ def evaluate_compliance(
         reason = (
             "Nessun manifest C2PA verificabile "
             "e il detector AI non ha rilevato "
-            "un'elevata probabilità di contenuto AI."
+            "un'elevata probabilitÃ  di contenuto AI."
         )
     else:
         reason = (
             "Nessun manifest C2PA verificabile. "
-            "Il detector AI non è disponibile."
+            "Il detector AI non Ã¨ disponibile."
         )
 
     return {
@@ -3521,8 +3521,8 @@ def apply_c2pa_fix(
     - certificato compatibile
     - configurazione C2PA corretta
 
-    Quando il signer sarà disponibile, questa funzione
-    produrrà il file remediato e lo caricherà nel bucket:
+    Quando il signer sarÃ  disponibile, questa funzione
+    produrrÃ  il file remediato e lo caricherÃ  nel bucket:
 
         Fixer AI-act shield
     """
@@ -3533,7 +3533,7 @@ def apply_c2pa_fix(
 
     log(
         "Fixer C2PA non ancora attivo: "
-        "nessuna firma falsa verrà applicata."
+        "nessuna firma falsa verrÃ  applicata."
     )
 
     return None
@@ -4010,49 +4010,49 @@ def process_single_audit(
         )
     )
 
-compliance_status = (
-    compliance_result.get(
-        "status"
+    compliance_status = (
+        compliance_result.get(
+            "status"
+        )
     )
-)
 
-decision = (
-    compliance_result.get(
-        "decision"
+    decision = (
+        compliance_result.get(
+            "decision"
+        )
     )
-)
 
-decision_basis = (
-    compliance_result.get(
-        "decision_basis"
+    decision_basis = (
+        compliance_result.get(
+            "decision_basis"
+        )
     )
-)
 
-recommendation = (
-    compliance_result.get(
-        "reason"
+    recommendation = (
+        compliance_result.get(
+            "reason"
+        )
     )
-)
 
-log(
+    log(
         f"Compliance: "
         f"{compliance_status}"
     )
-log(
-    f"Decision: "
-    f"{decision}"
-)
+    log(
+        f"Decision: "
+        f"{decision}"
+    )
 
-log(
-    f"Decision basis: "
-    f"{decision_basis}"
-)
-log(
+    log(
+        f"Decision basis: "
+        f"{decision_basis}"
+    )
+    log(
         f"Compliance reason: "
         f"{recommendation}"
     )
 
-     # ---------------------------------------------------------
+    # ---------------------------------------------------------
     # FIXER
     # ---------------------------------------------------------
 
@@ -4117,14 +4117,15 @@ log(
 
         "compliance":
             compliance_result,
-"decision":
-    decision,
 
-"decision_basis":
-    decision_basis,
+        "decision":
+            decision,
+
+        "decision_basis":
+            decision_basis,
+
         "recommendation":
             recommendation,
-
         "fixer": {
 
             "attempted":

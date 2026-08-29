@@ -4307,7 +4307,7 @@ recommendation = (
     )
 )
 
-    log(
+log(
         f"Compliance: "
         f"{compliance_status}"
     )
@@ -4320,7 +4320,7 @@ log(
     f"Decision basis: "
     f"{decision_basis}"
 )
-    log(
+log(
         f"Compliance reason: "
         f"{recommendation}"
     )

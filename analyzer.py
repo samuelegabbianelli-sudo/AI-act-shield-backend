@@ -1875,7 +1875,7 @@ def check_c2pa_metadata(
 
         return result
 
-      except Exception as e:
+    except Exception as e:
 
         error_message = str(e)
 

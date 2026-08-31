@@ -1875,14 +1875,49 @@ def check_c2pa_metadata(
 
         return result
 
-    except Exception as e:
+      except Exception as e:
+
+        error_message = str(e)
+
+        # ----------------------------------------------------
+        # Nessun manifest C2PA
+        # ----------------------------------------------------
+        # Alcune versioni dell'SDK C2PA sollevano
+        # ManifestNotFound quando il file non contiene
+        # alcun manifest.
+        #
+        # Questo NON è un errore del file:
+        # significa semplicemente C2PA non rilevato.
+        # ----------------------------------------------------
+
+        if (
+            "ManifestNotFound" in error_message
+            or
+            "no JUMB data found" in error_message
+        ):
+
+            result["detected"] = False
+            result["valid"] = False
+            result["trusted"] = False
+            result["status"] = "not_detected"
+            result["error"] = None
+
+            log(
+                "C2PA: nessun manifest rilevato."
+            )
+
+            return result
+
+        # ----------------------------------------------------
+        # Errore reale del motore C2PA
+        # ----------------------------------------------------
 
         result["status"] = (
             "error"
         )
 
         result["error"] = (
-            str(e)
+            error_message
         )
 
         result["valid"] = False
@@ -1892,7 +1927,7 @@ def check_c2pa_metadata(
         log(
             "C2PA engine ERROR: "
             f"mime={mime_type} "
-            f"error={e}"
+            f"error={error_message}"
         )
 
         return result

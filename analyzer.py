@@ -20,6 +20,7 @@ from c2pa import (
     Signer,
     C2paSignerInfo,
     C2paSigningAlg,
+    C2paBuilderIntent,
 )
 
 from ai_detector import analyze_image
@@ -3703,16 +3704,15 @@ def apply_c2pa_fix(
     try:
 
         signer_info = C2paSignerInfo(
-    alg=signing_algorithm,
-    sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
-    private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
-    ta_url=(
-        C2PA_TIMESTAMP_URL.encode("utf-8")
-        if C2PA_TIMESTAMP_URL
-        else None
-    )
-)
-
+            alg=signing_algorithm,
+            sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
+            private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+            ta_url=(
+                C2PA_TIMESTAMP_URL.encode("utf-8")
+                if C2PA_TIMESTAMP_URL
+                else None
+            )
+        )
         # ----------------------------------------------------
         # 7. FIRMA DEL FILE
         # ----------------------------------------------------
@@ -3727,45 +3727,46 @@ def apply_c2pa_fix(
             signer_info
         ) as signer:
 
-           with Builder(
-    manifest_json
-) as builder:
+            with Builder(
+                manifest_json
+            ) as builder:
+                builder.set_intent(
+                    C2paBuilderIntent.EDIT
+                )
+                # ----------------------------------------------------
+                # 7A. AGGIUNTA DEL FILE ORIGINALE COME INGREDIENT
+                # ----------------------------------------------------
 
-    # ----------------------------------------------------
-    # 7A. AGGIUNTA DEL FILE ORIGINALE COME INGREDIENT
-    # ----------------------------------------------------
+                ingredient_source = io.BytesIO(
+                    file_bytes
+                )
 
-    ingredient_source = io.BytesIO(
-        file_bytes
-    )
+                ingredient_json = json.dumps(
+                    {
+                        "title": file_name,
+                        "relationship": "parentOf",
+                        "label": "original-file"
+                    }
+                )
 
-    ingredient_json = json.dumps(
-        {
-            "title": file_name,
-            "relationship": "parentOf",
-            "label": "original-file"
-        }
-    )
+                builder.add_ingredient(
+                    ingredient_json,
+                    mime_type,
+                    ingredient_source
+                )
 
-    builder.add_ingredient(
-        ingredient_json,
-        mime_type,
-        ingredient_source
-    )
+                # ----------------------------------------------------
+                # 7B. FIRMA DEL FILE
+                # ----------------------------------------------------
 
-    # ----------------------------------------------------
-    # 7B. FIRMA DEL FILE
-    # ----------------------------------------------------
+                builder.sign(
+                    signer,
+                    mime_type,
+                    source,
+                    destination
+                )
 
-    builder.sign(
-        signer,
-        mime_type,
-        source,
-        destination
-    )
-
-        fixed_bytes = destination.getvalue()
-
+            fixed_bytes = destination.getvalue()
         if not fixed_bytes:
             log(
                 "Fixer C2PA fallito: "

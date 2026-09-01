@@ -3667,7 +3667,7 @@ def apply_c2pa_fix(
     # 5. MANIFEST C2PA
     # --------------------------------------------------------
 
-  manifest_json = json.dumps(
+    manifest_json = json.dumps(
     {
         "claim_generator_info": [
             {
@@ -3814,8 +3814,8 @@ def apply_c2pa_fix(
 def upload_fixed_file(
     file_bytes: bytes,
     audit_id: str,
-    file_name: str,
-    mime_type: str
+    mime_type: str,
+    file_name: str
 ) -> str | None:
 
     safe_name = (

@@ -14,7 +14,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from supabase import create_client, Client
 import c2pa
-from c2pa import Context
+from c2pa import (
+    Context,
+    Builder,
+    Signer,
+    C2paSignerInfo,
+    C2paSigningAlg,
+)
 
 from ai_detector import analyze_image
 
@@ -174,6 +180,37 @@ C2PA_CONTEXT = None
 
 C2PA_TRUST_SOURCE = None
 
+# ============================================================
+# C2PA FIXER SIGNING
+# ============================================================
+
+C2PA_SIGNING_ENABLED = (
+    os.environ.get(
+        "C2PA_SIGNING_ENABLED",
+        "false"
+    ).lower()
+    == "true"
+)
+
+C2PA_SIGNING_CERT_PEM = os.environ.get(
+    "C2PA_SIGNING_CERT_PEM",
+    ""
+)
+
+C2PA_SIGNING_PRIVATE_KEY_PEM = os.environ.get(
+    "C2PA_SIGNING_PRIVATE_KEY_PEM",
+    ""
+)
+
+C2PA_SIGNING_ALGORITHM = os.environ.get(
+    "C2PA_SIGNING_ALGORITHM",
+    "ES256"
+)
+
+C2PA_TIMESTAMP_URL = os.environ.get(
+    "C2PA_TIMESTAMP_URL",
+    ""
+)
 
 # ============================================================
 # SUPABASE CLIENT
@@ -3543,36 +3580,232 @@ def apply_c2pa_fix(
     mime_type: str,
     file_name: str
 ):
-
     """
-    Placeholder intenzionale.
+    Applica una vera firma C2PA al file usando le credenziali
+    configurate tramite environment variables.
 
-    NON viene generata una firma C2PA falsa.
-
-    Per creare una vera credenziale C2PA servono:
-
-    - signer
-    - private key
-    - certificato compatibile
-    - configurazione C2PA corretta
-
-    Quando il signer sarÃ  disponibile, questa funzione
-    produrrÃ  il file remediato e lo caricherÃ  nel bucket:
-
-        Fixer AI-act shield
+    Non genera firme false:
+    - se il Fixer è disabilitato, non fa nulla
+    - se certificato o private key mancano, non fa nulla
+    - se la firma fallisce, non carica alcun file
     """
 
     log(
         f"Fixer richiesto per audit {audit_id}"
     )
 
-    log(
-        "Fixer C2PA non ancora attivo: "
-        "nessuna firma falsa verrÃ  applicata."
+    # --------------------------------------------------------
+    # 1. FIXER DISABILITATO
+    # --------------------------------------------------------
+
+    if not C2PA_SIGNING_ENABLED:
+        log(
+            "Fixer C2PA disabilitato: "
+            "C2PA_SIGNING_ENABLED != true"
+        )
+        return None
+
+    # --------------------------------------------------------
+    # 2. CREDENZIALI MANCANTI
+    # --------------------------------------------------------
+
+    if not C2PA_SIGNING_CERT_PEM:
+        log(
+            "Fixer C2PA impossibile: "
+            "C2PA_SIGNING_CERT_PEM non configurato."
+        )
+        return None
+
+    if not C2PA_SIGNING_PRIVATE_KEY_PEM:
+        log(
+            "Fixer C2PA impossibile: "
+            "C2PA_SIGNING_PRIVATE_KEY_PEM non configurato."
+        )
+        return None
+
+    # --------------------------------------------------------
+    # 3. MIME TYPE
+    # --------------------------------------------------------
+
+    if not mime_type:
+        log(
+            "Fixer C2PA impossibile: "
+            "mime_type mancante."
+        )
+        return None
+
+    # --------------------------------------------------------
+    # 4. ALGORITMO DI FIRMA
+    # --------------------------------------------------------
+
+    algorithm_map = {
+        "ES256": C2paSigningAlg.ES256,
+        "ES384": C2paSigningAlg.ES384,
+        "ES512": C2paSigningAlg.ES512,
+        "PS256": C2paSigningAlg.PS256,
+        "PS384": C2paSigningAlg.PS384,
+        "PS512": C2paSigningAlg.PS512,
+        "ED25519": C2paSigningAlg.ED25519,
+    }
+
+    algorithm_name = (
+        C2PA_SIGNING_ALGORITHM or "ES256"
+    ).upper()
+
+    signing_algorithm = algorithm_map.get(
+        algorithm_name
     )
 
-    return None
+    if signing_algorithm is None:
+        log(
+            f"Fixer C2PA impossibile: "
+            f"algoritmo non supportato: {algorithm_name}"
+        )
+        return None
 
+    # --------------------------------------------------------
+    # 5. MANIFEST C2PA
+    # --------------------------------------------------------
+
+  manifest_json = json.dumps(
+    {
+        "claim_generator_info": [
+            {
+                "name": "AI Act Shield",
+                "version": "3.0"
+            }
+        ],
+        "title": file_name,
+        "assertions": [
+            {
+                "label": "c2pa.actions.v2",
+                "data": {
+                    "actions": [
+                        {
+                            "action": "c2pa.opened",
+                            "parameters": {
+                                "ingredientIds": [
+                                    "original-file"
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+)
+
+    # --------------------------------------------------------
+    # 6. SIGNER
+    # --------------------------------------------------------
+
+    try:
+
+        signer_info = C2paSignerInfo(
+    alg=signing_algorithm,
+    sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
+    private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+    ta_url=(
+        C2PA_TIMESTAMP_URL.encode("utf-8")
+        if C2PA_TIMESTAMP_URL
+        else None
+    )
+)
+
+        # ----------------------------------------------------
+        # 7. FIRMA DEL FILE
+        # ----------------------------------------------------
+
+        source = io.BytesIO(
+            file_bytes
+        )
+
+        destination = io.BytesIO()
+
+        with Signer.from_info(
+            signer_info
+        ) as signer:
+
+           with Builder(
+    manifest_json
+) as builder:
+
+    # ----------------------------------------------------
+    # 7A. AGGIUNTA DEL FILE ORIGINALE COME INGREDIENT
+    # ----------------------------------------------------
+
+    ingredient_source = io.BytesIO(
+        file_bytes
+    )
+
+    ingredient_json = json.dumps(
+        {
+            "title": file_name,
+            "relationship": "parentOf",
+            "label": "original-file"
+        }
+    )
+
+    builder.add_ingredient(
+        ingredient_json,
+        mime_type,
+        ingredient_source
+    )
+
+    # ----------------------------------------------------
+    # 7B. FIRMA DEL FILE
+    # ----------------------------------------------------
+
+    builder.sign(
+        signer,
+        mime_type,
+        source,
+        destination
+    )
+
+        fixed_bytes = destination.getvalue()
+
+        if not fixed_bytes:
+            log(
+                "Fixer C2PA fallito: "
+                "il file firmato è vuoto."
+            )
+            return None
+
+        # ----------------------------------------------------
+        # 8. UPLOAD NEL BUCKET FIXER
+        # ----------------------------------------------------
+
+        fixed_url = upload_fixed_file(
+            fixed_bytes,
+            audit_id,
+            mime_type,
+            file_name
+        )
+
+        if not fixed_url:
+            log(
+                "Fixer C2PA: firma riuscita, "
+                "ma upload fallito."
+            )
+            return None
+
+        log(
+            f"Fixer C2PA completato per audit "
+            f"{audit_id}"
+        )
+
+        return fixed_url
+
+    except Exception as e:
+
+        log(
+            f"Fixer C2PA fallito per audit "
+            f"{audit_id}: {str(e)}"
+        )
+
+        return None
 
 # ============================================================
 # 20. UPLOAD FIXER

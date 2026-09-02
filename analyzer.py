@@ -3669,53 +3669,54 @@ def apply_c2pa_fix(
     # --------------------------------------------------------
 
     manifest_json = json.dumps(
-    {
-        "claim_generator_info": [
-            {
-                "name": "AI Act Shield",
-                "version": "3.0"
-            }
-        ],
-        "title": file_name,
-        "assertions": [
-            {
-                "label": "c2pa.actions.v2",
-                "data": {
-                    "actions": [
-                        {
-                            "action": "c2pa.opened",
-                            "parameters": {
-                                "ingredientIds": [
-                                    "original-file"
-                                ]
-                            }
-                        }
-                    ]
+        {
+            "claim_generator_info": [
+                {
+                    "name": "AI Act Shield",
+                    "version": "3.0"
                 }
-            }
-        ]
-    }
-)
+            ],
+            "title": file_name,
+            "assertions": [
+                {
+                    "label": "c2pa.actions.v2",
+                    "data": {
+                        "actions": [
+                            {
+                                "action": "c2pa.opened",
+                                "parameters": {
+                                    "ingredientIds": [
+                                        "original-file"
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
 
     # --------------------------------------------------------
-    # 6. SIGNER
+    # 6. SIGNER + FIRMA
     # --------------------------------------------------------
 
     try:
 
         signer_info = C2paSignerInfo(
             alg=signing_algorithm,
-            sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
-            private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+            sign_cert=C2PA_SIGNING_CERT_PEM.encode(
+                "utf-8"
+            ),
+            private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode(
+                "utf-8"
+            ),
             ta_url=(
                 C2PA_TIMESTAMP_URL.encode("utf-8")
                 if C2PA_TIMESTAMP_URL
                 else None
             )
         )
-        # ----------------------------------------------------
-        # 7. FIRMA DEL FILE
-        # ----------------------------------------------------
 
         source = io.BytesIO(
             file_bytes
@@ -3723,50 +3724,61 @@ def apply_c2pa_fix(
 
         destination = io.BytesIO()
 
-        with Signer.from_info(
-            signer_info
-        ) as signer:
+        # Context necessario per il Builder.
+        with c2pa.Context() as context:
 
-            with Builder(
-                manifest_json
-            ) as builder:
-                builder.set_intent(
-                    C2paBuilderIntent.EDIT
-                )
-                # ----------------------------------------------------
-                # 7A. AGGIUNTA DEL FILE ORIGINALE COME INGREDIENT
-                # ----------------------------------------------------
+            with Signer.from_info(
+                signer_info
+            ) as signer:
 
-                ingredient_source = io.BytesIO(
-                    file_bytes
-                )
+                with Builder(
+                    manifest_json,
+                    context
+                ) as builder:
 
-                ingredient_json = json.dumps(
-                    {
-                        "title": file_name,
-                        "relationship": "parentOf",
-                        "label": "original-file"
-                    }
-                )
+                    builder.set_intent(
+                        C2paBuilderIntent.EDIT
+                    )
 
-                builder.add_ingredient(
-                    ingredient_json,
-                    mime_type,
-                    ingredient_source
-                )
+                    # ------------------------------------------------
+                    # 6A. FILE ORIGINALE COME INGREDIENT
+                    # ------------------------------------------------
 
-                # ----------------------------------------------------
-                # 7B. FIRMA DEL FILE
-                # ----------------------------------------------------
+                    ingredient_source = io.BytesIO(
+                        file_bytes
+                    )
 
-                builder.sign(
-                    signer,
-                    mime_type,
-                    source,
-                    destination
-                )
+                    ingredient_json = json.dumps(
+                        {
+                            "title": file_name,
+                            "relationship": "parentOf",
+                            "label": "original-file"
+                        }
+                    )
 
-            fixed_bytes = destination.getvalue()
+                    builder.add_ingredient(
+                        ingredient_json,
+                        mime_type,
+                        ingredient_source
+                    )
+
+                    # ------------------------------------------------
+                    # 6B. FIRMA
+                    # ------------------------------------------------
+
+                    builder.sign(
+                        signer,
+                        mime_type,
+                        source,
+                        destination
+                    )
+
+        fixed_bytes = destination.getvalue()
+
+        # --------------------------------------------------------
+        # 7. VALIDAZIONE OUTPUT
+        # --------------------------------------------------------
+
         if not fixed_bytes:
             log(
                 "Fixer C2PA fallito: "
@@ -3774,9 +3786,9 @@ def apply_c2pa_fix(
             )
             return None
 
-        # ----------------------------------------------------
+        # --------------------------------------------------------
         # 8. UPLOAD NEL BUCKET FIXER
-        # ----------------------------------------------------
+        # --------------------------------------------------------
 
         fixed_url = upload_fixed_file(
             fixed_bytes,

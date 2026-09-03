@@ -427,7 +427,345 @@ def initialize_c2pa_context():
 class SimpleHTTPRequestHandler(
     BaseHTTPRequestHandler
 ):
+    def do_POST(self):
+        if self.path != "/fixer/c2pa":
+            self.send_response(404)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "Not found"
+                }).encode("utf-8")
+            )
+            return
 
+        fixer_api_key = FIXER_API_KEY
+
+        if not fixer_api_key:
+            self.send_response(503)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "Fixer API not configured"
+                }).encode("utf-8")
+            )
+            return
+
+        request_key = self.headers.get(
+            "X-Fixer-Key",
+            ""
+        )
+
+        if request_key != fixer_api_key:
+            self.send_response(401)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "Unauthorized"
+                }).encode("utf-8")
+            )
+            return
+
+        content_type = self.headers.get(
+            "Content-Type",
+            ""
+        )
+
+        if "application/json" not in content_type.lower():
+            self.send_response(400)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": (
+                        "Content-Type must be "
+                        "application/json"
+                    )
+                }).encode("utf-8")
+            )
+            return
+
+        try:
+            content_length = int(
+                self.headers.get(
+                    "Content-Length",
+                    "0"
+                )
+            )
+
+            body = self.rfile.read(
+                content_length
+            )
+
+            payload = json.loads(
+                body.decode("utf-8")
+            )
+
+        except Exception:
+            self.send_response(400)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "Invalid JSON body"
+                }).encode("utf-8")
+            )
+            return
+
+        audit_id = payload.get(
+            "audit_id"
+        )
+
+        if not audit_id or not isinstance(
+            audit_id,
+            str
+        ):
+            self.send_response(400)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "audit_id is required"
+                }).encode("utf-8")
+            )
+            return
+
+        try:
+            audit_response = (
+                supabase
+                .table("audits")
+                .select(
+                    "id, compliance_status, "
+                    "fixed_file_url, file_url"
+                )
+                .eq(
+                    "id",
+                    audit_id
+                )
+                .limit(1)
+                .execute()
+            )
+
+            audits = (
+                audit_response.data or []
+            )
+
+            if not audits:
+                self.send_response(404)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": False,
+                        "error": "Audit not found"
+                    }).encode("utf-8")
+                )
+                return
+
+            audit = audits[0]
+
+            compliance_status = (
+                audit.get(
+                    "compliance_status"
+                )
+            )
+
+            if compliance_status not in (
+                "manual_review",
+                "non_compliant"
+            ):
+                self.send_response(409)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": False,
+                        "error": (
+                            "Audit is not eligible "
+                            "for remediation"
+                        )
+                    }).encode("utf-8")
+                )
+                return
+
+            existing_fixed_url = (
+                audit.get(
+                    "fixed_file_url"
+                )
+            )
+
+            if existing_fixed_url:
+                self.send_response(200)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": True,
+                        "audit_id": audit_id,
+                        "status": (
+                            "already_remediated"
+                        ),
+                        "fixed_file_url": (
+                            existing_fixed_url
+                        )
+                    }).encode("utf-8")
+                )
+                return
+
+            file_url = audit.get(
+                "file_url"
+            )
+
+            if not file_url:
+                self.send_response(404)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": False,
+                        "error": (
+                            "Original file not found"
+                        )
+                    }).encode("utf-8")
+                )
+                return
+
+            print(
+                "Fixer manual remediation started"
+            )
+
+            file_bytes, storage_path = (
+                download_file_from_storage(
+                    file_url
+                )
+            )
+
+            file_name = os.path.basename(
+                storage_path
+            )
+
+            mime_type = detect_mime_type(
+                storage_path,
+                file_bytes
+            )
+
+            fixed_url = apply_c2pa_fix(
+                file_bytes,
+                audit_id,
+                mime_type,
+                file_name
+            )
+
+            if not fixed_url:
+                print(
+                    "Fixer manual remediation failed"
+                )
+
+                self.send_response(500)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": False,
+                        "error": (
+                            "C2PA remediation failed"
+                        )
+                    }).encode("utf-8")
+                )
+                return
+
+            (
+                supabase
+                .table("audits")
+                .update({
+                    "fixed_file_url": fixed_url
+                })
+                .eq(
+                    "id",
+                    audit_id
+                )
+                .execute()
+            )
+
+            print(
+                "Fixer manual remediation completed"
+            )
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": True,
+                    "audit_id": audit_id,
+                    "status": "remediated",
+                    "fixed_file_url": fixed_url
+                }).encode("utf-8")
+            )
+
+        except Exception as exc:
+            print(
+                f"Fixer manual remediation error: "
+                f"{exc}"
+            )
+
+            self.send_response(500)
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({
+                    "ok": False,
+                    "error": "Internal fixer error"
+                }).encode("utf-8")
+            )
+            return
     def do_GET(self):
 
         self.send_response(200)
@@ -4338,23 +4676,11 @@ def process_single_audit(
     # ---------------------------------------------------------
 
     fixed_url = None
+    fixer_attempted = False
 
-    fixer_attempted = (
-        compliance_status
-        == "non_compliant"
-    )
-
-    if fixer_attempted:
-        fixed_url = apply_c2pa_fix(
-            file_bytes,
-            audit_id,
-            mime_type,
-            file_name
-        )
     # --------------------------------------------------------
     # DETAILS
     # --------------------------------------------------------
-
     details = {
 
         "worker":

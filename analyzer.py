@@ -202,7 +202,10 @@ C2PA_SIGNING_PRIVATE_KEY_PEM = os.environ.get(
     "C2PA_SIGNING_PRIVATE_KEY_PEM",
     ""
 )
-
+FIXER_API_KEY = os.environ.get(
+    "FIXER_API_KEY",
+    ""
+)
 C2PA_SIGNING_ALGORITHM = os.environ.get(
     "C2PA_SIGNING_ALGORITHM",
     "ES256"

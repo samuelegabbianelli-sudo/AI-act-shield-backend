@@ -543,26 +543,28 @@ class SimpleHTTPRequestHandler(
         self.end_headers()
 
     def do_POST(self):
-if self.path != "/fixer/c2pa":
-    self.send_response(404)
+        if self.path != "/fixer/c2pa":
+            self.send_response(404)
 
-    self.send_header(
-        "Access-Control-Allow-Origin",
-        "*"
-    )
-    self.send_header(
-        "Access-Control-Allow-Headers",
-        "Authorization, Content-Type"
-    )
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                "*"
+            )
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type"
+            )
 
-    self.send_header(
-        "Content-Type",
-        "application/json"
-    )            
-    self.end_headers()
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
+
+            self.end_headers()
+
             self.wfile.write(
                 json.dumps({
-                    "ok": False,
+                    "ok": False,                   
                     "error": "Not found"
                 }).encode("utf-8")
             )

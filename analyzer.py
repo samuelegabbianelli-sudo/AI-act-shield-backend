@@ -422,6 +422,93 @@ def initialize_c2pa_context():
         f"{C2PA_TRUST_SOURCE}"
     )
 
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+def authenticate_supabase_request(
+    handler
+):
+    """
+    Autentica una richiesta HTTP tramite
+    Supabase access token.
+
+    Legge:
+        Authorization: Bearer <access_token>
+
+    Restituisce:
+        user_id
+
+    Solleva ValueError se la richiesta
+    non è autenticata o il token non è valido.
+    """
+
+    auth_header = handler.headers.get(
+        "Authorization",
+        ""
+    )
+
+    if not auth_header:
+        raise ValueError(
+            "Authorization header missing"
+        )
+
+    if not auth_header.startswith(
+        "Bearer "
+    ):
+        raise ValueError(
+            "Authorization header must use Bearer token"
+        )
+
+    token = auth_header[
+        len("Bearer "):
+    ].strip()
+
+    if not token:
+        raise ValueError(
+            "Access token missing"
+        )
+
+    try:
+        response = (
+            supabase
+            .auth
+            .get_user(token)
+        )
+
+    except Exception as e:
+        log(
+            f"Supabase token validation error: {e}"
+        )
+
+        raise ValueError(
+            "Invalid access token"
+        ) from e
+
+    user = getattr(
+        response,
+        "user",
+        None
+    )
+
+    if user is None:
+        raise ValueError(
+            "Invalid access token"
+        )
+
+    user_id = getattr(
+        user,
+        "id",
+        None
+    )
+
+    if not user_id:
+        raise ValueError(
+            "User ID not found in token"
+        )
+
+    return user_id
+
 
 # ============================================================
 # 4. HTTP SERVER PER RENDER
@@ -430,14 +517,49 @@ def initialize_c2pa_context():
 class SimpleHTTPRequestHandler(
     BaseHTTPRequestHandler
 ):
+    def do_OPTIONS(self):
+        self.send_response(204)
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "POST, OPTIONS"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type"
+        )
+
+        self.send_header(
+            "Access-Control-Max-Age",
+            "600"
+        )
+
+        self.end_headers()
+
     def do_POST(self):
-        if self.path != "/fixer/c2pa":
-            self.send_response(404)
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-            self.end_headers()
+if self.path != "/fixer/c2pa":
+    self.send_response(404)
+
+    self.send_header(
+        "Access-Control-Allow-Origin",
+        "*"
+    )
+    self.send_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type"
+    )
+
+    self.send_header(
+        "Content-Type",
+        "application/json"
+    )            
+    self.end_headers()
             self.wfile.write(
                 json.dumps({
                     "ok": False,
@@ -446,39 +568,34 @@ class SimpleHTTPRequestHandler(
             )
             return
 
-        fixer_api_key = FIXER_API_KEY
-
-        if not fixer_api_key:
-            self.send_response(503)
-            self.send_header(
-                "Content-Type",
-                "application/json"
+        try:
+            authenticated_user_id = (
+                authenticate_supabase_request(
+                    self
+                )
             )
+
+except ValueError as e:
+    self.send_response(401)
+
+    self.send_header(
+        "Access-Control-Allow-Origin",
+        "*"
+    )
+    self.send_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type"
+    )
+
+    self.send_header(
+        "Content-Type",
+        "application/json"
+    )            
             self.end_headers()
             self.wfile.write(
                 json.dumps({
                     "ok": False,
-                    "error": "Fixer API not configured"
-                }).encode("utf-8")
-            )
-            return
-
-        request_key = self.headers.get(
-            "X-Fixer-Key",
-            ""
-        )
-
-        if request_key != fixer_api_key:
-            self.send_response(401)
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({
-                    "ok": False,
-                    "error": "Unauthorized"
+                    "error": str(e)
                 }).encode("utf-8")
             )
             return
@@ -562,15 +679,15 @@ class SimpleHTTPRequestHandler(
         try:
             audit_response = (
                 supabase
-                .table("audits")
-                .select(
-                    "id, compliance_status, "
-                    "fixed_file_url, file_url"
-                )
-                .eq(
-                    "id",
-                    audit_id
-                )
+        .table("audits")
+        .select(
+            "id, user_id, compliance_status, "
+            "fixed_file_url, file_url"
+        )
+        .eq(
+            "id",
+            audit_id
+        )
                 .limit(1)
                 .execute()
             )
@@ -579,13 +696,23 @@ class SimpleHTTPRequestHandler(
                 audit_response.data or []
             )
 
-            if not audits:
-                self.send_response(404)
-                self.send_header(
-                    "Content-Type",
-                    "application/json"
-                )
-                self.end_headers()
+if not audits:
+    self.send_response(404)
+
+    self.send_header(
+        "Access-Control-Allow-Origin",
+        "*"
+    )
+    self.send_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type"
+    )
+
+    self.send_header(
+        "Content-Type",
+        "application/json"
+    )                
+    self.end_headers()
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
@@ -595,7 +722,20 @@ class SimpleHTTPRequestHandler(
                 return
 
             audit = audits[0]
-
+            if audit.get("user_id") != authenticated_user_id:
+                self.send_response(403)
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+                self.end_headers()
+                self.wfile.write(
+                    json.dumps({
+                        "ok": False,
+                        "error": "Forbidden"
+                    }).encode("utf-8")
+                )
+                return
             compliance_status = (
                 audit.get(
                     "compliance_status"
@@ -606,13 +746,24 @@ class SimpleHTTPRequestHandler(
                 "manual_review",
                 "non_compliant"
             ):
-                self.send_response(409)
-                self.send_header(
-                    "Content-Type",
-                    "application/json"
-                )
-                self.end_headers()
-                self.wfile.write(
+            self.send_response(409)
+
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                "*"
+            )
+
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type"
+            )
+
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )                
+            self.end_headers()
+            self.wfile.write(
                     json.dumps({
                         "ok": False,
                         "error": (
@@ -654,13 +805,23 @@ class SimpleHTTPRequestHandler(
                 "file_url"
             )
 
-            if not file_url:
-                self.send_response(404)
-                self.send_header(
-                    "Content-Type",
-                    "application/json"
-                )
-                self.end_headers()
+if not file_url:
+    self.send_response(404)
+
+    self.send_header(
+        "Access-Control-Allow-Origin",
+        "*"
+    )
+    self.send_header(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type"
+    )
+
+    self.send_header(
+        "Content-Type",
+        "application/json"
+    )                
+    self.end_headers()
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
@@ -702,12 +863,23 @@ class SimpleHTTPRequestHandler(
                     "Fixer manual remediation failed"
                 )
 
-                self.send_response(500)
-                self.send_header(
-                    "Content-Type",
-                    "application/json"
-                )
-                self.end_headers()
+            self.send_response(500)
+
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                "*"
+            )
+
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type"
+            )
+
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )                
+            self.end_headers()
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
@@ -735,20 +907,38 @@ class SimpleHTTPRequestHandler(
                 "Fixer manual remediation completed"
             )
 
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({
-                    "ok": True,
-                    "audit_id": audit_id,
-                    "status": "remediated",
-                    "fixed_file_url": fixed_url
-                }).encode("utf-8")
-            )
+        self.send_response(200)
+
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            "*"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Methods",
+            "POST, OPTIONS"
+        )
+
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type"
+        )
+
+        self.send_header(
+            "Content-Type",
+            "application/json"
+        )
+
+        self.end_headers()
+
+        self.wfile.write(
+            json.dumps({
+                "ok": True,
+                "audit_id": audit_id,
+                "status": "remediated",
+                "fixed_file_url": fixed_url
+            }).encode("utf-8")
+        )
 
         except Exception as exc:
             print(
@@ -757,10 +947,21 @@ class SimpleHTTPRequestHandler(
             )
 
             self.send_response(500)
+
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                "*"
+            )
+
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type"
+            )
+
             self.send_header(
                 "Content-Type",
                 "application/json"
-            )
+            )            
             self.end_headers()
             self.wfile.write(
                 json.dumps({
@@ -4648,6 +4849,9 @@ def process_single_audit(
         compliance_result.get(
             "decision_basis"
         )
+        or compliance_result.get(
+            "reason"
+        )
     )
 
     recommendation = (
@@ -4655,7 +4859,6 @@ def process_single_audit(
             "reason"
         )
     )
-
     log(
         f"Compliance: "
         f"{compliance_status}"

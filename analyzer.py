@@ -684,15 +684,15 @@ class SimpleHTTPRequestHandler(
         try:
             audit_response = (
                 supabase
-        .table("audits")
-        .select(
-            "id, user_id, compliance_status, "
-            "fixed_file_url, file_url"
-        )
-        .eq(
-            "id",
-            audit_id
-        )
+                .table("audits")
+                .select(
+                    "id, user_id, compliance_status, "
+                    "fixed_file_url, file_url"
+                )
+                .eq(
+                    "id",
+                    audit_id
+                )
                 .limit(1)
                 .execute()
             )
@@ -701,46 +701,66 @@ class SimpleHTTPRequestHandler(
                 audit_response.data or []
             )
 
-if not audits:
-    self.send_response(404)
+            if not audits:
+                self.send_response(404)
 
-    self.send_header(
-        "Access-Control-Allow-Origin",
-        "*"
-    )
-    self.send_header(
-        "Access-Control-Allow-Headers",
-        "Authorization, Content-Type"
-    )
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
 
-    self.send_header(
-        "Content-Type",
-        "application/json"
-    )                
-    self.end_headers()
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
+
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+
+                self.end_headers()
+
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
                         "error": "Audit not found"
                     }).encode("utf-8")
                 )
+
                 return
 
             audit = audits[0]
+
             if audit.get("user_id") != authenticated_user_id:
                 self.send_response(403)
+
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
+
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
+
                 self.send_header(
                     "Content-Type",
                     "application/json"
                 )
+
                 self.end_headers()
+
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
                         "error": "Forbidden"
                     }).encode("utf-8")
                 )
+
                 return
+
             compliance_status = (
                 audit.get(
                     "compliance_status"
@@ -751,24 +771,26 @@ if not audits:
                 "manual_review",
                 "non_compliant"
             ):
-            self.send_response(409)
+                self.send_response(409)
 
-            self.send_header(
-                "Access-Control-Allow-Origin",
-                "*"
-            )
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
 
-            self.send_header(
-                "Access-Control-Allow-Headers",
-                "Authorization, Content-Type"
-            )
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
 
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )                
-            self.end_headers()
-            self.wfile.write(
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+
+                self.end_headers()
+
+                self.wfile.write(
                     json.dumps({
                         "ok": False,
                         "error": (
@@ -777,6 +799,7 @@ if not audits:
                         )
                     }).encode("utf-8")
                 )
+
                 return
 
             existing_fixed_url = (
@@ -787,11 +810,24 @@ if not audits:
 
             if existing_fixed_url:
                 self.send_response(200)
+
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
+
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
+
                 self.send_header(
                     "Content-Type",
                     "application/json"
                 )
+
                 self.end_headers()
+
                 self.wfile.write(
                     json.dumps({
                         "ok": True,
@@ -804,29 +840,33 @@ if not audits:
                         )
                     }).encode("utf-8")
                 )
+
                 return
 
             file_url = audit.get(
                 "file_url"
             )
 
-if not file_url:
-    self.send_response(404)
+            if not file_url:
+                self.send_response(404)
 
-    self.send_header(
-        "Access-Control-Allow-Origin",
-        "*"
-    )
-    self.send_header(
-        "Access-Control-Allow-Headers",
-        "Authorization, Content-Type"
-    )
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
 
-    self.send_header(
-        "Content-Type",
-        "application/json"
-    )                
-    self.end_headers()
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
+
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+
+                self.end_headers()
+
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
@@ -835,6 +875,7 @@ if not file_url:
                         )
                     }).encode("utf-8")
                 )
+
                 return
 
             print(
@@ -868,23 +909,25 @@ if not file_url:
                     "Fixer manual remediation failed"
                 )
 
-            self.send_response(500)
+                self.send_response(500)
 
-            self.send_header(
-                "Access-Control-Allow-Origin",
-                "*"
-            )
+                self.send_header(
+                    "Access-Control-Allow-Origin",
+                    "*"
+                )
 
-            self.send_header(
-                "Access-Control-Allow-Headers",
-                "Authorization, Content-Type"
-            )
+                self.send_header(
+                    "Access-Control-Allow-Headers",
+                    "Authorization, Content-Type"
+                )
 
-            self.send_header(
-                "Content-Type",
-                "application/json"
-            )                
-            self.end_headers()
+                self.send_header(
+                    "Content-Type",
+                    "application/json"
+                )
+
+                self.end_headers()
+
                 self.wfile.write(
                     json.dumps({
                         "ok": False,
@@ -893,6 +936,7 @@ if not file_url:
                         )
                     }).encode("utf-8")
                 )
+
                 return
 
             (
@@ -912,38 +956,38 @@ if not file_url:
                 "Fixer manual remediation completed"
             )
 
-        self.send_response(200)
+            self.send_response(200)
 
-        self.send_header(
-            "Access-Control-Allow-Origin",
-            "*"
-        )
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                "*"
+            )
 
-        self.send_header(
-            "Access-Control-Allow-Methods",
-            "POST, OPTIONS"
-        )
+            self.send_header(
+                "Access-Control-Allow-Methods",
+                "POST, OPTIONS"
+            )
 
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type"
-        )
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type"
+            )
 
-        self.send_header(
-            "Content-Type",
-            "application/json"
-        )
+            self.send_header(
+                "Content-Type",
+                "application/json"
+            )
 
-        self.end_headers()
+            self.end_headers()
 
-        self.wfile.write(
-            json.dumps({
-                "ok": True,
-                "audit_id": audit_id,
-                "status": "remediated",
-                "fixed_file_url": fixed_url
-            }).encode("utf-8")
-        )
+            self.wfile.write(
+                json.dumps({
+                    "ok": True,
+                    "audit_id": audit_id,
+                    "status": "remediated",
+                    "fixed_file_url": fixed_url
+                }).encode("utf-8")
+            )
 
         except Exception as exc:
             print(

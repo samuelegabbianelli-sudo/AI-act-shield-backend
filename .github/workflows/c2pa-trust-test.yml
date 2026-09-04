@@ -1,0 +1,219 @@
+name: C2PA Trust Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  c2pa-trust-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install C2PA
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install c2pa-python==0.37.7
+
+      - name: Extract signed PNG
+        run: |
+          python - <<'PY'
+          import glob
+          import zipfile
+
+          zips = glob.glob("*.zip")
+
+          if not zips:
+              raise SystemExit("Nessun file ZIP di test trovato.")
+
+          zip_path = zips[0]
+
+          with zipfile.ZipFile(zip_path, "r") as z:
+              pngs = [
+                  name for name in z.namelist()
+                  if name.lower().endswith(".png")
+              ]
+
+              if not pngs:
+                  raise SystemExit("Nessun PNG trovato nello ZIP.")
+
+              png_name = pngs[0]
+
+              with z.open(png_name) as src, open("test-signed.png", "wb") as dst:
+                  dst.write(src.read())
+
+          print(f"PNG estratto: {png_name}")
+          PY
+
+      - name: Run C2PA trust comparison
+        run: |
+          python - <<'PY'
+          import json
+          from c2pa import Context, Reader
+
+          PNG = "test-signed.png"
+          CERT = "trust/test/test-signing-cert.pem"
+
+          PRODUCTION_TRUST_URL = (
+              "https://raw.githubusercontent.com/"
+              "c2pa-org/conformance-public/"
+              "refs/heads/main/trust-list/C2PA-TRUST-LIST.pem"
+          )
+
+          def read_with_context(label, context):
+              print("")
+              print("=" * 70)
+              print(label)
+              print("=" * 70)
+
+              with open(PNG, "rb") as stream:
+                  reader = Reader(
+                      "image/png",
+                      stream,
+                      context=context
+                  )
+
+                  data = json.loads(reader.json())
+
+              validation_state = data.get("validation_state")
+
+              validation_results = data.get(
+                  "validation_results"
+              ) or {}
+
+              active = validation_results.get(
+                  "activeManifest",
+                  {}
+              ) if isinstance(validation_results, dict) else {}
+
+              success = active.get("success", [])
+
+              success_codes = []
+
+              for item in success:
+                  if isinstance(item, dict):
+                      code = item.get("code")
+                      if code:
+                          success_codes.append(code)
+
+              trusted = (
+                  "signingCredential.trusted"
+                  in success_codes
+                  or str(validation_state).lower() == "trusted"
+              )
+
+              print(f"validation_state = {validation_state}")
+              print(f"signingCredential.trusted = "
+                    f"{'signingCredential.trusted' in success_codes}")
+              print(f"trusted = {trusted}")
+              print(
+                  "success_codes =",
+                  success_codes
+              )
+
+              return {
+                  "validation_state": validation_state,
+                  "trusted": trusted,
+                  "success_codes": success_codes
+              }
+
+          # --------------------------------------------------
+          # PRODUCTION
+          # --------------------------------------------------
+
+          print("")
+          print("DOWNLOAD TRUST LIST UFFICIALE")
+
+          import urllib.request
+
+          with urllib.request.urlopen(
+              PRODUCTION_TRUST_URL,
+              timeout=30
+          ) as response:
+              production_pem = response.read().decode("utf-8")
+
+          production_context = Context.from_dict({
+              "trust": {
+                  "trust_anchors": production_pem
+              },
+              "verify": {
+                  "verify_after_reading": True,
+                  "verify_trust": True,
+                  "verify_timestamp_trust": True,
+                  "ocsp_fetch": False,
+                  "remote_manifest_fetch": True
+              }
+          })
+
+          production = read_with_context(
+              "PROFILE: PRODUCTION TRUST LIST",
+              production_context
+          )
+
+          # --------------------------------------------------
+          # TEST
+          # --------------------------------------------------
+
+          with open(CERT, "r", encoding="utf-8") as f:
+              test_cert = f.read()
+
+          test_context = Context.from_dict({
+              "trust": {
+                  "allowed_list": test_cert
+              },
+              "verify": {
+                  "verify_after_reading": True,
+                  "verify_trust": True,
+                  "verify_timestamp_trust": True,
+                  "ocsp_fetch": False,
+                  "remote_manifest_fetch": True
+              }
+          })
+
+          test = read_with_context(
+              "PROFILE: TEST - ALLOWED TEST CERTIFICATE",
+              test_context
+          )
+
+          # --------------------------------------------------
+          # FINAL RESULT
+          # --------------------------------------------------
+
+          print("")
+          print("=" * 70)
+          print("FINAL RESULT")
+          print("=" * 70)
+
+          print(
+              "Production trusted:",
+              production["trusted"]
+          )
+
+          print(
+              "Test trusted:",
+              test["trusted"]
+          )
+
+          if production["trusted"]:
+              raise SystemExit(
+                  "FAIL: il certificato di test risulta trusted "
+                  "anche con la trust list di produzione."
+              )
+
+          if not test["trusted"]:
+              raise SystemExit(
+                  "FAIL: il certificato di test NON risulta trusted "
+                  "con allowed_list."
+              )
+
+          print("")
+          print("PASS: trusted=false -> trusted=true")
+          print("Il profilo di test ha modificato il trust "
+                "senza modificare il file.")
+          PY

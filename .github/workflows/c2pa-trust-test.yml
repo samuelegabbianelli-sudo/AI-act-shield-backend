@@ -58,7 +58,7 @@ jobs:
           from c2pa import Context, Reader
 
           PNG = "test-signed.png"
-          CERT = "trust/test/test-signing-cert.pem"
+          CERT = "trust/test/C2PA-Test-Intermediate-CA.pem"
 
           PRODUCTION_TRUST_URL = (
               "https://raw.githubusercontent.com/"
@@ -161,11 +161,11 @@ jobs:
           # --------------------------------------------------
 
           with open(CERT, "r", encoding="utf-8") as f:
-              test_cert = f.read()
+              test_ca = f.read()
 
           test_context = Context.from_dict({
               "trust": {
-                  "allowed_list": test_cert
+                  "user_anchors": test_ca
               },
               "verify": {
                   "verify_after_reading": True,
@@ -174,12 +174,11 @@ jobs:
                   "ocsp_fetch": False,
                   "remote_manifest_fetch": True
               }
-          })
-
-          test = read_with_context(
-              "PROFILE: TEST - ALLOWED TEST CERTIFICATE",
+           })
+           test = read_with_context(
+              "PROFILE: TEST - USER ANCHOR INTERMEDIATE CA",
               test_context
-          )
+           )
 
           # --------------------------------------------------
           # FINAL RESULT

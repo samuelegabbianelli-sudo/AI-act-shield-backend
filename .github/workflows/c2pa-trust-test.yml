@@ -174,11 +174,11 @@ jobs:
                   "ocsp_fetch": False,
                   "remote_manifest_fetch": True
               }
-           })
-           test = read_with_context(
+          })
+          test = read_with_context(
               "PROFILE: TEST - USER ANCHOR INTERMEDIATE CA",
               test_context
-           )
+          )
 
           # --------------------------------------------------
           # FINAL RESULT

@@ -2046,10 +2046,22 @@ def update_audit(
     audit_id: str,
     payload: dict
 ):
+    # The current audits schema has no legacy "status" column.
+    # Keep status only as an internal/response concept and never
+    # send it to Supabase.
+    safe_payload = {
+        key: value
+        for key, value in payload.items()
+        if key != "status"
+    }
+
+    if not safe_payload:
+        return
+
     (
         supabase
         .table("audits")
-        .update(payload)
+        .update(safe_payload)
         .eq(
             "id",
             audit_id
@@ -2064,7 +2076,7 @@ def fetch_pending_audits():
         .table("audits")
         .select("*")
         .eq(
-            "status",
+            "compliance_status",
             "pending"
         )
         .order(

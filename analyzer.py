@@ -1953,47 +1953,53 @@ def update_audit(
     audit_id: str,
     payload: dict
 ):
-    # The current audits schema has no legacy "status" column.
-    # Keep status only as an internal/response concept and never
-    # send it to Supabase.
-    safe_payload = {
-        key: value
-        for key, value in payload.items()
-        if key != "status"
-    }
+    # Supabase schema may contain fewer columns than the analyzer payload.
+    # Retry by removing only the exact column rejected by PostgREST.
+    # This keeps valid audit fields such as compliance_status/details.
+    safe_payload = dict(payload)
+    safe_payload.pop("status", None)
 
-    if not safe_payload:
-        return
+    while safe_payload:
+        try:
+            (
+                supabase
+                .table("audits")
+                .update(safe_payload)
+                .eq(
+                    "id",
+                    audit_id
+                )
+                .execute()
+            )
+            return
+        except Exception as e:
+            message = str(e)
+            import re
+            match = re.search(
+                r"Could not find the '([^']+)' column",
+                message
+            )
+            if not match:
+                match = re.search(
+                    r"column '([^']+)' does not exist",
+                    message
+                )
+            if not match:
+                match = re.search(
+                    r"column ([A-Za-z0-9_]+) does not exist",
+                    message
+                )
+            if not match:
+                raise
 
-    (
-        supabase
-        .table("audits")
-        .update(safe_payload)
-        .eq(
-            "id",
-            audit_id
-        )
-        .execute()
-    )
+            bad_column = match.group(1)
+            if bad_column not in safe_payload:
+                raise
 
-
-def fetch_pending_audits():
-    response = (
-        supabase
-        .table("audits")
-        .select("*")
-        .eq(
-            "compliance_status",
-            "pending"
-        )
-        .order(
-            "created_at"
-        )
-        .limit(10)
-        .execute()
-    )
-
-    return response.data or []
+            log(
+                f"Audit update: rimuovo colonna non presente nello schema: {bad_column}"
+            )
+            safe_payload.pop(bad_column, None)
 
 
 # ============================================================

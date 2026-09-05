@@ -1,9 +1,7 @@
 name: Fix storage download and audit error handling
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   patch:

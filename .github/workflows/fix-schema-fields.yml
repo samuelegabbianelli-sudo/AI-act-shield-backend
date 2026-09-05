@@ -15,7 +15,48 @@ jobs:
 
       - name: Patch analyzer
         run: |
-          python -c 'from pathlib import Path; p=Path("analyzer.py"); t=p.read_text(encoding="utf-8"); old="""                \"ai_detector_available\": (\n                    ai_result[\"available\"]\n                ),\n"""; assert old in t, "ai_detector_available block not found"; t=t.replace(old, "", 1); old="""                \"status\": \"error\",\n                \"error_message\": (\n                    \"File URL mancante\"\n                )\n"""; new="""                \"compliance_status\": \"manual_review\",\n                \"recommendation\": \"Errore tecnico: file URL mancante.\"\n"""; assert old in t, "missing file_url error block not found"; t=t.replace(old,new,1); old="""                \"status\": \"error\",\n                \"error_message\": str(e)\n"""; new="""                \"compliance_status\": \"manual_review\",\n                \"recommendation\": \"Errore tecnico durante l'analisi: \" + str(e)\n"""; assert old in t, "exception error block not found"; t=t.replace(old,new,1); compile(t,"analyzer.py","exec"); p.write_text(t,encoding="utf-8"); print("analyzer.py schema patch syntax OK")'
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_len = len(text)
+
+          text, ai_count = re.subn(
+              r'(?ms)^\s*"ai_detector_available":\s*\(\s*ai_result\["available"\]\s*\),\s*$',
+              "",
+              text,
+              count=1,
+          )
+          if ai_count != 1:
+              raise SystemExit(f"ai_detector_available block matches: {ai_count}")
+
+          text, status_count = re.subn(
+              r'"status":\s*"error",',
+              '"compliance_status": "manual_review",',
+              text,
+          )
+          if status_count < 1:
+              raise SystemExit(f"error status matches: {status_count}")
+
+          text, error_count = re.subn(
+              r'"error_message":',
+              '"recommendation":',
+              text,
+          )
+          if error_count < 1:
+              raise SystemExit(f"error_message matches: {error_count}")
+
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+          print(f"Patched analyzer.py: {old_len} -> {len(text)} chars")
+          print(f"ai_detector_available removed: {ai_count}")
+          print(f"error status fields replaced: {status_count}")
+          print(f"error_message fields replaced: {error_count}")
+          print("analyzer.py syntax OK")
+          PY
 
       - name: Commit patch
         run: |

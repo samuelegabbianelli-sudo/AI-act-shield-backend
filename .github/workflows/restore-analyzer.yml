@@ -1,0 +1,81 @@
+name: Restore analyzer safely
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    if: github.event.head_commit.message != 'Restore analyzer from known-good blob'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore analyzer and apply user anchors
+        shell: python
+        run: |
+          import subprocess
+          from pathlib import Path
+
+          subprocess.run([
+              "git", "checkout",
+              "8b8feae571322afbd7fa84d955f37ac3480c79d0",
+              "--", "analyzer.py"
+          ], check=True)
+
+          p = Path("analyzer.py")
+          text = p.read_text(encoding="utf-8")
+
+          anchor_marker = 'C2PA_TRUST_ANCHORS_PEM = os.environ.get(\n    "C2PA_TRUST_ANCHORS_PEM",\n    ""\n)\n'
+          anchor_insert = anchor_marker + '''\n# Certificati aggiuntivi interni ad AI Act Shield.\n# Se valorizzato, viene aggiunto tramite user_anchors senza\n# sostituire la trust list ufficiale C2PA.\nC2PA_USER_ANCHORS_PEM = os.environ.get(\n    "C2PA_USER_ANCHORS_PEM",\n    ""\n)\n'''
+
+          if "C2PA_USER_ANCHORS_PEM" not in text:
+              if anchor_marker not in text:
+                  raise SystemExit("Anchor insertion point not found")
+              text = text.replace(anchor_marker, anchor_insert, 1)
+
+          old = '''    # --------------------------------------------------------\n    # Context C2PA\n'''
+          new = '''    user_anchors = C2PA_USER_ANCHORS_PEM.strip()\n\n    if user_anchors and "BEGIN CERTIFICATE" not in user_anchors:\n        raise RuntimeError(\n            "C2PA_USER_ANCHORS_PEM configurata "\n            "ma non contiene certificati PEM validi."\n        )\n\n    # --------------------------------------------------------\n    # Context C2PA\n'''
+          if "user_anchors = C2PA_USER_ANCHORS_PEM.strip()" not in text:
+              if old not in text:
+                  raise SystemExit("Context insertion point not found")
+              text = text.replace(old, new, 1)
+
+          old = '''    config = {\n\n        "trust": {\n\n            "trust_anchors":\n                anchors\n        },\n'''
+          new = '''    trust_config = {\n        "trust_anchors": anchors\n    }\n\n    if user_anchors:\n        trust_config["user_anchors"] = user_anchors\n\n    config = {\n\n        "trust": trust_config,\n'''
+          if 'trust_config["user_anchors"]' not in text:
+              if old not in text:
+                  raise SystemExit("Trust config insertion point not found")
+              text = text.replace(old, new, 1)
+
+          old = '''    log(\n        "C2PA trust verification: ENABLED"\n    )\n\n    log(\n        "C2PA trust source: "\n'''
+          new = '''    log(\n        "C2PA trust verification: ENABLED"\n    )\n\n    if user_anchors:\n        log(\n            "C2PA additional user trust anchors: ENABLED"\n        )\n    else:\n        log(\n            "C2PA additional user trust anchors: DISABLED"\n        )\n\n    log(\n        "C2PA trust source: "\n'''
+          if "C2PA additional user trust anchors" not in text:
+              if old not in text:
+                  raise SystemExit("Trust log insertion point not found")
+              text = text.replace(old, new, 1)
+
+          p.write_text(text, encoding="utf-8")
+          compile(text, "analyzer.py", "exec")
+
+      - name: Verify and commit
+        run: |
+          test "$(wc -l < analyzer.py)" -ge 5000
+          grep -q 'C2PA_USER_ANCHORS_PEM' analyzer.py
+          grep -q '"compliance_status"' analyzer.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git commit -m "Restore analyzer from known-good blob"
+          git push
+
+      - name: Remove temporary workflow
+        run: |
+          git rm .github/workflows/restore-analyzer.yml
+          git commit -m "Remove temporary restore workflow"
+          git push

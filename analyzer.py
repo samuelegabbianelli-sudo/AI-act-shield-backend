@@ -1059,126 +1059,72 @@ class SimpleHTTPRequestHandler(
 # 5. STORAGE
 # ============================================================
 
-def parse_storage_ref(file_url: str):
-    """
-    Estrae bucket e path da una reference Supabase Storage.
-    """
-
+def normalize_storage_path(file_url: str):
+    """Extract only the object path from an audit file_url."""
     if not file_url:
-        raise ValueError(
-            "Storage reference vuota"
-        )
+        raise ValueError("file_url vuoto")
 
     value = str(file_url).strip()
 
     if value.startswith("storage://"):
         parsed = urlparse(value)
-        bucket = parsed.netloc
-        path = parsed.path.lstrip("/")
+        bucket = unquote(parsed.netloc)
+        object_path = unquote(parsed.path.lstrip("/"))
 
-        if not bucket or not path:
+        if bucket and bucket != MEDIA_BUCKET:
             raise ValueError(
-                "Storage reference non valida"
+                f"Bucket Storage inatteso: {bucket}. Atteso: {MEDIA_BUCKET}"
             )
 
-        return bucket, unquote(path)
+        if not object_path:
+            raise ValueError("Storage reference priva di path")
 
-    if value.startswith("http://") or value.startswith("https://"):
-        parsed = urlparse(value)
-        path = parsed.path
+        return object_path
 
-        marker = "/storage/v1/object/"
+    if not value.startswith(("http://", "https://")):
+        return unquote(value.lstrip("/"))
 
-        if marker not in path:
-            raise ValueError(
-                "URL Supabase Storage non riconosciuto"
-            )
+    parsed = urlparse(value)
+    path = unquote(parsed.path.lstrip("/"))
 
-        suffix = path.split(
-            marker,
-            1
-        )[1].lstrip("/")
+    markers = [
+        "storage/v1/object/public/" + MEDIA_BUCKET + "/",
+        "storage/v1/object/sign/" + MEDIA_BUCKET + "/",
+        "storage/v1/object/authenticated/" + MEDIA_BUCKET + "/",
+        "storage/v1/object/download/" + MEDIA_BUCKET + "/",
+    ]
 
-        parts = suffix.split(
-            "/",
-            1
-        )
+    for marker in markers:
+        if marker in path:
+            object_path = path.split(marker, 1)[1]
+            if object_path:
+                return object_path
 
-        if len(parts) != 2:
-            raise ValueError(
-                "URL Storage privo di bucket/path"
-            )
-
-        mode = parts[0]
-
-        if mode in (
-            "public",
-            "sign",
-            "download"
-        ):
-            remainder = parts[1]
-        else:
-            remainder = suffix
-
-        parts = remainder.split(
-            "/",
-            1
-        )
-
-        if len(parts) != 2:
-            raise ValueError(
-                "URL Storage non valida"
-            )
-
-        bucket, object_path = parts
-
-        return (
-            unquote(bucket),
-            unquote(object_path)
-        )
-
-    if value.startswith("/"):
-        value = value.lstrip("/")
-
-    parts = value.split(
-        "/",
-        1
-    )
-
-    if len(parts) != 2:
-        raise ValueError(
-            "Storage reference non valida"
-        )
-
-    return (
-        parts[0],
-        unquote(parts[1])
+    raise ValueError(
+        f"URL Storage non riconosciuta per il bucket {MEDIA_BUCKET}: {file_url}"
     )
 
 
 def download_file_from_storage(file_url: str):
-    bucket, path = parse_storage_ref(
-        file_url
-    )
+    storage_path = normalize_storage_path(file_url)
+
+    log(f"Download bucket={MEDIA_BUCKET}")
+    log(f"Download path={storage_path}")
 
     response = (
         supabase
         .storage
-        .from_(bucket)
-        .download(path)
+        .from_(MEDIA_BUCKET)
+        .download(storage_path)
     )
 
     if response is None:
-        raise RuntimeError(
-            "Download Storage restituisce None"
-        )
+        raise RuntimeError("Download Storage restituisce None")
 
     file_bytes = bytes(response)
 
     if not file_bytes:
-        raise RuntimeError(
-            "File scaricato vuoto"
-        )
+        raise RuntimeError("File scaricato vuoto")
 
     if len(file_bytes) > MAX_FILE_SIZE_BYTES:
         raise RuntimeError(
@@ -1186,46 +1132,7 @@ def download_file_from_storage(file_url: str):
             f"{len(file_bytes)} bytes"
         )
 
-    return (
-        file_bytes,
-        path
-    )
-
-
-def upload_fixed_file(
-    file_bytes: bytes,
-    audit_id: str,
-    file_name: str,
-    mime_type: str
-):
-    safe_name = os.path.basename(
-        file_name
-    )
-
-    object_path = (
-        f"{audit_id}/"
-        f"{int(time.time() * 1000)}-"
-        f"{safe_name}"
-    )
-
-    (
-        supabase
-        .storage
-        .from_(FIXER_BUCKET)
-        .upload(
-            object_path,
-            file_bytes,
-            {
-                "content-type": mime_type,
-                "upsert": False
-            }
-        )
-    )
-
-    return (
-        f"storage://{FIXER_BUCKET}/"
-        f"{object_path}"
-    )
+    return file_bytes, storage_path
 
 
 # ============================================================

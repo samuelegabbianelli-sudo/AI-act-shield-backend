@@ -1,0 +1,75 @@
+name: Fix audit schema fields
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch analyzer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_ai = '''                "ai_detector_available": (
+                    ai_result["available"]
+                ),
+'''
+          if old_ai not in text:
+              raise SystemExit("ai_detector_available block not found")
+          text = text.replace(old_ai, "", 1)
+
+          old_missing_url = '''                "status": "error",
+                "error_message": (
+                    "File URL mancante"
+                )
+'''
+          new_missing_url = '''                "compliance_status": "manual_review",
+                "recommendation": "Errore tecnico: file URL mancante."
+'''
+          if old_missing_url not in text:
+              raise SystemExit("missing file_url error block not found")
+          text = text.replace(old_missing_url, new_missing_url, 1)
+
+          old_exception = '''                "status": "error",
+                "error_message": str(e)
+'''
+          new_exception = '''                "compliance_status": "manual_review",
+                "recommendation": (
+                    "Errore tecnico durante l'analisi: "
+                    + str(e)
+                )
+'''
+          if old_exception not in text:
+              raise SystemExit("exception error block not found")
+          text = text.replace(old_exception, new_exception, 1)
+
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+          print("analyzer.py schema patch syntax OK")
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git diff --cached --quiet || git commit -m "Fix audit schema field references"
+          git push
+
+      - name: Remove temporary workflow
+        run: |
+          rm -f .github/workflows/fix-schema-fields.yml
+          git add .github/workflows/fix-schema-fields.yml
+          git commit -m "Remove temporary schema fix workflow"
+          git push

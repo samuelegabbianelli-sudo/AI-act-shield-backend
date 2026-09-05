@@ -1,0 +1,69 @@
+name: Fix C2PA signer safely
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Repair signer block and validate
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          start = text.find("    signer_info = C2paSignerInfo(")
+          builder = text.find("    builder = Builder(", start)
+
+          if start < 0 or builder < 0:
+              raise SystemExit(
+                  f"Signer block not found: start={start}, builder={builder}"
+              )
+
+          replacement = '''    signer_info = C2paSignerInfo(
+        alg=_get_signing_algorithm(),
+        sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
+        private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+        ta_url=(
+            C2PA_TIMESTAMP_URL.strip().encode("utf-8")
+            if C2PA_TIMESTAMP_URL.strip()
+            else None
+        )
+    )
+
+    signer = Signer.from_info(
+        signer_info
+    )
+
+'''
+
+          text = text[:start] + replacement + text[builder:]
+
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+          print("C2PA signer block repaired and syntax check passed.")
+          PY
+
+      - name: Commit repair
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git commit -m "Fix C2PA signer constructor" || echo "No changes to commit"
+          git push
+
+      - name: Remove temporary workflow
+        if: always()
+        run: |
+          git rm .github/workflows/fix-c2pa-signer-safe.yml || true
+          git commit -m "Remove temporary signer repair workflow" || true
+          git push || true

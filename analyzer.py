@@ -2336,6 +2336,24 @@ def process_single_audit(
 
 
 # ============================================================
+def fetch_pending_audits():
+    response = (
+        supabase
+        .table("audits")
+        .select(
+            "id, user_id, file_url, compliance_status, fixed_file_url"
+        )
+        .eq(
+            "compliance_status",
+            "pending"
+        )
+        .limit(10)
+        .execute()
+    )
+
+    return response.data or []
+
+
 # 15. WORKER LOOP
 # ============================================================
 

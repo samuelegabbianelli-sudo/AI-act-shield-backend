@@ -1,0 +1,58 @@
+name: Fix audit status column
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.event.head_commit.message != 'Fix audit worker status column'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Patch analyzer
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path("analyzer.py")
+          text = p.read_text(encoding="utf-8")
+
+          old_query = '''        .eq(\n            "status",\n            "pending"\n        )'''
+          new_query = '''        .eq(\n            "compliance_status",\n            "pending"\n        )'''
+
+          if old_query not in text:
+              raise SystemExit("Pending audit query pattern not found")
+          text = text.replace(old_query, new_query, 1)
+
+          old_update = '''def update_audit(\n    audit_id: str,\n    payload: dict\n):\n    (\n        supabase\n        .table("audits")\n        .update(payload)'''
+          new_update = '''def update_audit(\n    audit_id: str,\n    payload: dict\n):\n    # The current audits schema has no legacy "status" column.\n    # Keep status only as an internal/response concept and never\n    # send it to Supabase.\n    safe_payload = {\n        key: value\n        for key, value in payload.items()\n        if key != "status"\n    }\n\n    if not safe_payload:\n        return\n\n    (\n        supabase\n        .table("audits")\n        .update(safe_payload)'''
+
+          if old_update not in text:
+              raise SystemExit("update_audit pattern not found")
+          text = text.replace(old_update, new_update, 1)
+
+          compile(text, "analyzer.py", "exec")
+          p.write_text(text, encoding="utf-8")
+
+          print("OK: analyzer.py patched and syntax-checked")
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git commit -m "Fix audit worker status column"
+          git push
+
+      - name: Remove temporary workflow
+        run: |
+          git rm .github/workflows/fix-audit-status.yml
+          git commit -m "Remove temporary audit status workflow"
+          git push

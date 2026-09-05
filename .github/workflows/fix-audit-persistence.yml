@@ -1,0 +1,49 @@
+name: Fix audit persistence
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch update_audit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          start = text.index("def update_audit(")
+          marker = "\n\n# ============================================================\n"
+          end = text.index(marker, start)
+
+          replacement = '''def update_audit(\n    audit_id: str,\n    payload: dict\n):\n    # Supabase schema may contain fewer columns than the analyzer payload.\n    # Retry by removing only the exact column rejected by PostgREST.\n    # This keeps valid audit fields such as compliance_status/details.\n    safe_payload = dict(payload)\n    safe_payload.pop("status", None)\n\n    while safe_payload:\n        try:\n            (\n                supabase\n                .table("audits")\n                .update(safe_payload)\n                .eq(\n                    "id",\n                    audit_id\n                )\n                .execute()\n            )\n            return\n        except Exception as e:\n            message = str(e)\n            import re\n            match = re.search(\n                r"Could not find the '([^']+)' column",\n                message\n            )\n            if not match:\n                match = re.search(\n                    r"column '([^']+)' does not exist",\n                    message\n                )\n            if not match:\n                match = re.search(\n                    r"column ([A-Za-z0-9_]+) does not exist",\n                    message\n                )\n            if not match:\n                raise\n\n            bad_column = match.group(1)\n            if bad_column not in safe_payload:\n                raise\n\n            log(\n                f"Audit update: rimuovo colonna non presente nello schema: {bad_column}"\n            )\n            safe_payload.pop(bad_column, None)\n\n\n'''
+
+          text = text[:start] + replacement + text[end + 2:]
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+          print("analyzer.py audit persistence patch syntax OK")
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git diff --cached --quiet || git commit -m "Make audit persistence schema tolerant"
+          git push
+
+      - name: Remove temporary workflow
+        run: |
+          rm -f .github/workflows/fix-audit-persistence.yml
+          git add .github/workflows/fix-audit-persistence.yml
+          git commit -m "Remove temporary audit persistence workflow"
+          git push

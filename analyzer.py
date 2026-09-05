@@ -2131,8 +2131,8 @@ def process_single_audit(
         update_audit(
             audit_id,
             {
-                "status": "error",
-                "error_message": (
+                "compliance_status": "manual_review",
+                "recommendation": (
                     "File URL mancante"
                 )
             }
@@ -2285,9 +2285,7 @@ def process_single_audit(
                         "signing_credential"
                     ]
                 ),
-                "ai_detector_available": (
-                    ai_result["available"]
-                ),
+
                 "ai_generated": (
                     ai_result["ai_generated"]
                 ),
@@ -2325,8 +2323,8 @@ def process_single_audit(
         update_audit(
             audit_id,
             {
-                "status": "error",
-                "error_message": str(e)
+                "compliance_status": "manual_review",
+                "recommendation": str(e)
             }
         )
 

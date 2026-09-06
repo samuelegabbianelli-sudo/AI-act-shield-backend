@@ -1,0 +1,56 @@
+name: Fix missing upload helper
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add upload_fixed_file helper
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          if "def upload_fixed_file(" in text:
+              print("upload_fixed_file already exists; nothing to do.")
+          else:
+              marker = "def apply_c2pa_fix("
+              if marker not in text:
+                  raise SystemExit("Could not find apply_c2pa_fix marker.")
+
+              helper = '''def upload_fixed_file(\n    file_bytes: bytes,\n    audit_id: str,\n    file_name: str,\n    mime_type: str\n) -> str | None:\n    safe_name = (\n        file_name\n        .replace("/", "_")\n        .replace("\\\\", "_")\n    )\n\n    storage_path = (\n        f"{audit_id}/{safe_name}"\n    )\n\n    try:\n        (\n            supabase\n            .storage\n            .from_(FIXER_BUCKET)\n            .upload(\n                storage_path,\n                file_bytes,\n                {\n                    "content-type": mime_type,\n                    "upsert": "true"\n                }\n            )\n        )\n\n        log(\n            f"File fixer caricato: "\n            f"{FIXER_BUCKET}/{storage_path}"\n        )\n\n        return storage_path\n\n    except Exception as e:\n        log(\n            f"Errore upload fixer: {e}"\n        )\n        return None\n\n\n'''
+
+              text = text.replace(marker, helper + marker, 1)
+              compile(text, "analyzer.py", "exec")
+              path.write_text(text, encoding="utf-8")
+              print("upload_fixed_file inserted successfully.")
+              print("analyzer.py syntax check: PASSED")
+          PY
+
+      - name: Verify
+        shell: bash
+        run: |
+          grep -n -A35 "def upload_fixed_file" analyzer.py
+          python -m py_compile analyzer.py
+          echo "Upload helper verification: PASSED"
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git diff --cached --check
+          git commit -m "Restore fixer upload helper"
+          git push

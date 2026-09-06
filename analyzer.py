@@ -1517,13 +1517,6 @@ def check_c2pa_metadata(
         not validation_errors
     )
 
-    if result["trusted"]:
-        if C2PA_USER_ANCHORS_PEM.strip():
-            result["trust_source"] = "ai_act_shield_policy"
-            result["status"] = "trusted_internal"
-        else:
-            result["trust_source"] = "c2pa_official"
-
     # --------------------------------------------------------
     # VALIDITY LOGIC
     # --------------------------------------------------------
@@ -1566,7 +1559,12 @@ def check_c2pa_metadata(
     result["valid"] = True
 
     if result["trusted"]:
-        result["status"] = "trusted"
+        if C2PA_USER_ANCHORS_PEM.strip():
+            result["trust_source"] = "ai_act_shield_policy"
+            result["status"] = "trusted_internal"
+        else:
+            result["trust_source"] = "c2pa_official"
+            result["status"] = "trusted"
 
     elif (
         "signingCredential.untrusted"

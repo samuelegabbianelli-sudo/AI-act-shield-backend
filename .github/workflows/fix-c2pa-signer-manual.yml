@@ -15,24 +15,31 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Repair C2PA signer block
+        shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re
 
           path = Path("analyzer.py")
           text = path.read_text(encoding="utf-8")
 
-          pattern = re.compile(
-              r'    signer_info = C2paSignerInfo\('
-              r'.*?'
-              r'    signer = Signer\.from_info\('
-              r'\s+signer_info\s+'
-              r'\)\s*',
-              re.DOTALL
-          )
+          old = '''    signer_info = C2paSignerInfo(
+        cert_pem=C2PA_SIGNING_CERT_PEM,
+        private_key_pem=C2PA_SIGNING_PRIVATE_KEY_PEM,
+        algorithm=_get_signing_algorithm()
+    )
 
-          replacement = '''    signer_info = C2paSignerInfo(
+    if C2PA_TIMESTAMP_URL.strip():
+        signer_info.timestamp_url = (
+            C2PA_TIMESTAMP_URL.strip()
+        )
+
+    signer = Signer.from_info(
+        signer_info
+    )
+'''
+
+          new = '''    signer_info = C2paSignerInfo(
         alg=_get_signing_algorithm(),
         sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
         private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
@@ -46,55 +53,44 @@ jobs:
     signer = Signer.from_info(
         signer_info
     )
-
 '''
 
-          new_text, count = pattern.subn(
-              replacement,
-              text,
-              count=1
-          )
-
-          if count != 1:
+          if old not in text:
               raise SystemExit(
-                  f"Expected exactly one signer block, found {count}"
+                  "Expected old C2PA signer block was not found."
               )
 
-          compile(
-              new_text,
-              "analyzer.py",
-              "exec"
-          )
+          if text.count(old) != 1:
+              raise SystemExit(
+                  f"Expected one signer block, found {text.count(old)}."
+              )
 
-          path.write_text(
-              new_text,
-              encoding="utf-8"
-          )
+          new_text = text.replace(old, new, 1)
 
-          print(
-              "C2PA signer block repaired successfully."
-          )
-          print(
-              "analyzer.py syntax check: PASSED"
-          )
+          compile(new_text, "analyzer.py", "exec")
+
+          path.write_text(new_text, encoding="utf-8")
+
+          print("C2PA signer block repaired successfully.")
+          print("analyzer.py syntax check: PASSED")
           PY
 
-      - name: Show repaired signer block
+      - name: Verify repaired code
+        shell: bash
         run: |
-          grep -n -A15 -B2 \
-            "signer_info = C2paSignerInfo" \
-            analyzer.py
+          grep -n -A12 -B2 "signer_info = C2paSignerInfo" analyzer.py
+          grep -n "cert_pem=" analyzer.py && exit 1 || true
+          grep -n "private_key_pem=" analyzer.py && exit 1 || true
+          grep -n "algorithm=_get_signing_algorithm" analyzer.py && exit 1 || true
+          echo "Old signer arguments not found. Verification passed."
 
       - name: Commit repair
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add analyzer.py
-
           git diff --cached --check
-
-          git commit \
-            -m "Fix C2PA signer constructor"
-
+          git diff --cached -- analyzer.py
+          git commit -m "Fix C2PA signer constructor"
           git push

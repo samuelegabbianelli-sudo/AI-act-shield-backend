@@ -2028,6 +2028,51 @@ def _get_signing_algorithm():
     return algorithm_map[key]
 
 
+def upload_fixed_file(
+    file_bytes: bytes,
+    audit_id: str,
+    file_name: str,
+    mime_type: str
+) -> str | None:
+    safe_name = (
+        file_name
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+    storage_path = (
+        f"{audit_id}/{safe_name}"
+    )
+
+    try:
+        (
+            supabase
+            .storage
+            .from_(FIXER_BUCKET)
+            .upload(
+                storage_path,
+                file_bytes,
+                {
+                    "content-type": mime_type,
+                    "upsert": "true"
+                }
+            )
+        )
+
+        log(
+            f"File fixer caricato: "
+            f"{FIXER_BUCKET}/{storage_path}"
+        )
+
+        return storage_path
+
+    except Exception as e:
+        log(
+            f"Errore upload fixer: {e}"
+        )
+        return None
+
+
 def apply_c2pa_fix(
     file_bytes: bytes,
     audit_id: str,

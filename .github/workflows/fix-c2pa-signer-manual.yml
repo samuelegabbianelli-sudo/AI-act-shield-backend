@@ -14,68 +14,76 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Repair signer block and validate
+      - name: Repair C2PA signer block
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
 
           path = Path("analyzer.py")
           text = path.read_text(encoding="utf-8")
 
-          start = text.find(
-              "    signer_info = C2paSignerInfo("
+          pattern = re.compile(
+              r'    signer_info = C2paSignerInfo\('
+              r'.*?'
+              r'    signer = Signer\.from_info\('
+              r'\s+signer_info\s+'
+              r'\)\s*',
+              re.DOTALL
           )
-
-          builder = text.find(
-              "    builder = Builder(",
-              start
-          )
-
-          if start < 0 or builder < 0:
-              raise SystemExit(
-                  f"Signer block not found: "
-                  f"start={start}, builder={builder}"
-              )
 
           replacement = '''    signer_info = C2paSignerInfo(
-              alg=_get_signing_algorithm(),
-              sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
-              private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
-              ta_url=(
-                  C2PA_TIMESTAMP_URL.strip().encode("utf-8")
-                  if C2PA_TIMESTAMP_URL.strip()
-                  else None
+        alg=_get_signing_algorithm(),
+        sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
+        private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+        ta_url=(
+            C2PA_TIMESTAMP_URL.strip().encode("utf-8")
+            if C2PA_TIMESTAMP_URL.strip()
+            else None
+        )
+    )
+
+    signer = Signer.from_info(
+        signer_info
+    )
+
+'''
+
+          new_text, count = pattern.subn(
+              replacement,
+              text,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  f"Expected exactly one signer block, found {count}"
               )
-          )
-
-          signer = Signer.from_info(
-              signer_info
-          )
-
-          '''
-
-          text = (
-              text[:start]
-              + replacement
-              + text[builder:]
-          )
 
           compile(
-              text,
+              new_text,
               "analyzer.py",
               "exec"
           )
 
           path.write_text(
-              text,
+              new_text,
               encoding="utf-8"
           )
 
           print(
-              "C2PA signer block repaired "
-              "and syntax check passed."
+              "C2PA signer block repaired successfully."
+          )
+          print(
+              "analyzer.py syntax check: PASSED"
           )
           PY
+
+      - name: Show repaired signer block
+        run: |
+          grep -n -A15 -B2 \
+            "signer_info = C2paSignerInfo" \
+            analyzer.py
 
       - name: Commit repair
         run: |
@@ -84,18 +92,9 @@ jobs:
 
           git add analyzer.py
 
+          git diff --cached --check
+
           git commit \
             -m "Fix C2PA signer constructor"
 
           git push
-
-      - name: Remove temporary workflow
-        if: always()
-        run: |
-          git rm .github/workflows/fix-c2pa-signer-manual.yml || true
-
-          git commit \
-            -m "Remove temporary signer repair workflow" \
-            || true
-
-          git push || true

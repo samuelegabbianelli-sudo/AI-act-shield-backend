@@ -1517,6 +1517,13 @@ def check_c2pa_metadata(
         not validation_errors
     )
 
+    if result["trusted"]:
+        if C2PA_USER_ANCHORS_PEM.strip():
+            result["trust_source"] = "ai_act_shield_policy"
+            result["status"] = "trusted_internal"
+        else:
+            result["trust_source"] = "c2pa_official"
+
     # --------------------------------------------------------
     # VALIDITY LOGIC
     # --------------------------------------------------------
@@ -1843,6 +1850,21 @@ def evaluate_compliance(
         "status"
     )
 
+    if c2pa_status == "trusted_internal":
+        return {
+            "status": "compliant",
+            "decision": "c2pa_internal_policy",
+            "reason": (
+                "Manifest C2PA valido e signing credential verificato "
+                "secondo la policy interna di AI Act Shield. "
+                "Questa verifica non equivale a trusted ufficiale C2PA."
+            ),
+            "decision_basis": (
+                "C2PA trusted via AI Act Shield Policy"
+            ),
+            "trust_source": "ai_act_shield_policy"
+        }
+
     if c2pa_status == "trusted":
         return {
             "status": "compliant",
@@ -1855,7 +1877,8 @@ def evaluate_compliance(
             ),
             "decision_basis": (
                 "C2PA trusted"
-            )
+            ),
+            "trust_source": "c2pa_official"
         }
 
     if c2pa_status == "valid_untrusted":

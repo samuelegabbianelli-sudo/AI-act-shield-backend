@@ -17,7 +17,54 @@ jobs:
       - name: Repair C2PA signer block
         shell: bash
         run: |
-          python -c 'from pathlib import Path; p=Path("analyzer.py"); s=p.read_text(encoding="utf-8"); s=s.replace("        cert_pem=C2PA_SIGNING_CERT_PEM,", "        sign_cert=C2PA_SIGNING_CERT_PEM.encode(\"utf-8\"),"); s=s.replace("        private_key_pem=C2PA_SIGNING_PRIVATE_KEY_PEM,", "        private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode(\"utf-8\"),"); s=s.replace("        algorithm=_get_signing_algorithm()", "        alg=_get_signing_algorithm(),"); old="""    if C2PA_TIMESTAMP_URL.strip():\n        signer_info.timestamp_url = (\n            C2PA_TIMESTAMP_URL.strip()\n        )\n"""; new="""        ta_url=(\n            C2PA_TIMESTAMP_URL.strip().encode(\"utf-8\")\n            if C2PA_TIMESTAMP_URL.strip()\n            else None\n        )\n"""; s=s.replace(old,new,1); compile(s,"analyzer.py","exec"); p.write_text(s,encoding="utf-8")'
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          lines = path.read_text(encoding="utf-8").splitlines()
+
+          start = next(
+              i for i, line in enumerate(lines)
+              if line.strip() == "signer_info = C2paSignerInfo("
+          )
+
+          signer_start = next(
+              i for i in range(start, len(lines))
+              if lines[i].strip() == "signer = Signer.from_info("
+          )
+
+          signer_end = next(
+              i for i in range(signer_start + 1, len(lines))
+              if lines[i].strip() == ")"
+          )
+
+          replacement = [
+              "    signer_info = C2paSignerInfo(",
+              "        alg=_get_signing_algorithm(),",
+              "        sign_cert=C2PA_SIGNING_CERT_PEM.encode(\"utf-8\"),",
+              "        private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode(\"utf-8\"),",
+              "        ta_url=(",
+              "            C2PA_TIMESTAMP_URL.strip().encode(\"utf-8\")",
+              "            if C2PA_TIMESTAMP_URL.strip()",
+              "            else None",
+              "        )",
+              "    )",
+              "",
+              "    signer = Signer.from_info(",
+              "        signer_info",
+              "    )",
+          ]
+
+          lines[start:signer_end + 1] = replacement
+          new_text = "\n".join(lines) + "\n"
+
+          compile(new_text, "analyzer.py", "exec")
+          path.write_text(new_text, encoding="utf-8")
+
+          print("C2PA signer block repaired successfully.")
+          print(f"Replaced lines {start + 1}-{signer_end + 1}.")
+          print("analyzer.py syntax check: PASSED")
+          PY
 
       - name: Verify repaired code
         shell: bash
@@ -30,6 +77,18 @@ jobs:
           fi
           if grep -q "private_key_pem=C2PA_SIGNING_PRIVATE_KEY_PEM" analyzer.py; then
             echo "Old private_key_pem parameter still present"
+            exit 1
+          fi
+          if ! grep -q "sign_cert=C2PA_SIGNING_CERT_PEM.encode(\"utf-8\")" analyzer.py; then
+            echo "New sign_cert parameter not found"
+            exit 1
+          fi
+          if ! grep -q "private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode(\"utf-8\")" analyzer.py; then
+            echo "New private_key parameter not found"
+            exit 1
+          fi
+          if ! grep -q "alg=_get_signing_algorithm()" analyzer.py; then
+            echo "New alg parameter not found"
             exit 1
           fi
           echo "C2PA signer repair verification: PASSED"

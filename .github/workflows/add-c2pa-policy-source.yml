@@ -1,0 +1,145 @@
+name: Add C2PA policy trust source
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add trust source classification
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''    result["trusted"] = bool(
+        (
+            trusted_from_success
+            or
+            trusted_from_state
+        )
+        and
+        not validation_errors
+    )
+'''
+
+          new = '''    result["trusted"] = bool(
+        (
+            trusted_from_success
+            or
+            trusted_from_state
+        )
+        and
+        not validation_errors
+    )
+
+    # Distinguish official C2PA trust from an explicitly configured
+    # AI Act Shield internal trust policy. The latter is enabled only
+    # when C2PA_USER_ANCHORS_PEM is configured in the runtime environment.
+    if result["trusted"]:
+        if C2PA_USER_ANCHORS_PEM.strip():
+            result["trust_source"] = "ai_act_shield_policy"
+            result["status"] = "trusted_internal"
+        else:
+            result["trust_source"] = "c2pa_official"
+'''
+
+          if old not in text:
+              raise SystemExit("Expected C2PA trusted block was not found.")
+
+          if text.count(old) != 1:
+              raise SystemExit(f"Expected one trusted block, found {text.count(old)}.")
+
+          text = text.replace(old, new, 1)
+
+          old_eval = '''    if c2pa_status == "trusted":
+        return {
+            "status": "compliant",
+            "decision": "c2pa_trusted",
+            "reason": (
+                "Provenienza C2PA verificata e trusted. "
+                "La verifica crittografica ha priorità "
+                "rispetto alla classificazione probabilistica "
+                "del detector AI."
+            ),
+            "decision_basis": (
+                "C2PA trusted"
+            )
+        }
+'''
+
+          new_eval = '''    if c2pa_status == "trusted_internal":
+        return {
+            "status": "compliant",
+            "decision": "c2pa_internal_policy",
+            "reason": (
+                "Manifest C2PA valido e signing credential verificato "
+                "secondo la policy interna di AI Act Shield. "
+                "Questa verifica non equivale a trusted ufficiale C2PA."
+            ),
+            "decision_basis": (
+                "C2PA trusted via AI Act Shield Policy"
+            ),
+            "trust_source": "ai_act_shield_policy"
+        }
+
+    if c2pa_status == "trusted":
+        return {
+            "status": "compliant",
+            "decision": "c2pa_trusted",
+            "reason": (
+                "Provenienza C2PA verificata e trusted. "
+                "La verifica crittografica ha priorità "
+                "rispetto alla classificazione probabilistica "
+                "del detector AI."
+            ),
+            "decision_basis": (
+                "C2PA trusted"
+            ),
+            "trust_source": "c2pa_official"
+        }
+'''
+
+          if old_eval not in text:
+              raise SystemExit("Expected compliance trusted block was not found.")
+
+          if text.count(old_eval) != 1:
+              raise SystemExit(f"Expected one compliance trusted block, found {text.count(old_eval)}.")
+
+          text = text.replace(old_eval, new_eval, 1)
+
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+
+          print("C2PA trust source classification added.")
+          print("analyzer.py syntax check: PASSED")
+          PY
+
+      - name: Verify
+        shell: bash
+        run: |
+          python -m py_compile analyzer.py
+          grep -n -A20 -B3 'trust_source' analyzer.py
+          grep -n -A18 'if c2pa_status == "trusted_internal"' analyzer.py
+          echo "C2PA policy trust source verification: PASSED"
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git diff --cached --check
+          git commit -m "Distinguish AI Act Shield policy trust"
+          git push

@@ -2050,15 +2050,15 @@ def apply_c2pa_fix(
         )
 
     signer_info = C2paSignerInfo(
-        cert_pem=C2PA_SIGNING_CERT_PEM,
-        private_key_pem=C2PA_SIGNING_PRIVATE_KEY_PEM,
-        algorithm=_get_signing_algorithm()
-    )
-
-    if C2PA_TIMESTAMP_URL.strip():
-        signer_info.timestamp_url = (
-            C2PA_TIMESTAMP_URL.strip()
+        alg=_get_signing_algorithm(),
+        sign_cert=C2PA_SIGNING_CERT_PEM.encode("utf-8"),
+        private_key=C2PA_SIGNING_PRIVATE_KEY_PEM.encode("utf-8"),
+        ta_url=(
+            C2PA_TIMESTAMP_URL.strip().encode("utf-8")
+            if C2PA_TIMESTAMP_URL.strip()
+            else None
         )
+    )
 
     signer = Signer.from_info(
         signer_info

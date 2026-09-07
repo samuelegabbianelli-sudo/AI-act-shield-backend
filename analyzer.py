@@ -1542,8 +1542,17 @@ def check_c2pa_metadata(
         real_validation_errors
     )
 
+    # C2PA can report a top-level Invalid validation state even when
+    # individual validation result entries do not expose success=False.
+    # Never allow the internal trust policy to override that state.
+    validation_state_invalid = (
+        str(validation_state).lower()
+        == "invalid"
+    )
+
     has_real_errors = bool(
         real_validation_errors
+        or validation_state_invalid
     )
 
     has_manifest = bool(

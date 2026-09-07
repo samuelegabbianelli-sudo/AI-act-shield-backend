@@ -270,7 +270,6 @@ if diagnostic_marker not in text:
     text = text.replace(anchor, diagnostic, 1)
 
 # 5. Add an EARLY C2PA diagnostic before the trust/validity gates.
-# This tells us why the internal-policy branch may be skipped.
 early_marker = '"AI Act Shield C2PA pre-policy diagnostic: "'
 if early_marker not in text:
     anchor = '''    # --------------------------------------------------------
@@ -303,7 +302,62 @@ if early_marker not in text:
         raise SystemExit("C2PA trust logic anchor not found for early diagnostic.")
     text = text.replace(anchor, early_diagnostic, 1)
 
+# 6. Fix validation error collection.
+# The previous implementation treated every C2PA validation code as an error,
+# including successful codes such as claimSignature.validated and hashedURI.match.
+# A manifest with validation_state=Valid must not be blocked by those success codes.
+old_error_function = '''def _collect_validation_errors(node):
+    errors = []
+
+    for item in _flatten_validation_results(
+        node
+    ):
+        code = item.get("code")
+
+        if not isinstance(code, str):
+            continue
+
+        if code == "signingCredential.untrusted":
+            continue
+
+        errors.append(item)
+
+    return errors
+'''
+
+new_error_function = '''def _collect_validation_errors(node):
+    errors = []
+
+    # C2PA validation_results contains both successful validation events
+    # and actual failures. Only explicit success=False entries are errors.
+    # Keep signingCredential.untrusted out of integrity failures because it
+    # means the signer is not trusted, not that the manifest is corrupted.
+    for item in _flatten_validation_results(
+        node
+    ):
+        code = item.get("code")
+
+        if not isinstance(code, str):
+            continue
+
+        if code == "signingCredential.untrusted":
+            continue
+
+        success = item.get("success")
+
+        if success is False:
+            errors.append(item)
+
+    return errors
+'''
+
+if old_error_function in text:
+    text = text.replace(old_error_function, new_error_function, 1)
+elif new_error_function not in text:
+    raise SystemExit("Expected validation error collector not found.")
+
 compile(text, "analyzer.py", "exec")
 path.write_text(text, encoding="utf-8")
 print("Internal policy recognition patch/diagnostics applied.")
+print("C2PA validation error filter fixed.")
 print("analyzer.py syntax check: PASSED")

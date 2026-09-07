@@ -1,0 +1,264 @@
+name: Fix internal C2PA policy recognition
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch C2PA policy recognition
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_globals = '''C2PA_CONTEXT = None
+
+C2PA_TRUST_SOURCE = None'''
+          new_globals = '''C2PA_CONTEXT = None
+
+# Separate context used only for the AI Act Shield internal policy.
+# The primary C2PA context remains official-trust-only.
+C2PA_POLICY_CONTEXT = None
+
+C2PA_TRUST_SOURCE = None'''
+
+          if old_globals not in text:
+              raise SystemExit("Expected C2PA globals block not found.")
+
+          text = text.replace(old_globals, new_globals, 1)
+
+          start = text.index("def initialize_c2pa_context():")
+          end = text.index("\n\n# ============================================================\n# AUTHENTICATION", start)
+
+          new_initialize = '''def initialize_c2pa_context():
+
+    global C2PA_CONTEXT
+    global C2PA_POLICY_CONTEXT
+    global C2PA_TRUST_SOURCE
+
+    anchors, source = (
+        load_c2pa_trust_anchors()
+    )
+
+    user_anchors = C2PA_USER_ANCHORS_PEM.strip()
+    signer_cert = C2PA_SIGNING_CERT_PEM.strip()
+
+    if user_anchors and "BEGIN CERTIFICATE" not in user_anchors:
+        raise RuntimeError(
+            "C2PA_USER_ANCHORS_PEM configurata "
+            "ma non contiene certificati PEM validi."
+        )
+
+    if signer_cert and "BEGIN CERTIFICATE" not in signer_cert:
+        raise RuntimeError(
+            "C2PA_SIGNING_CERT_PEM configurato "
+            "ma non contiene un certificato PEM valido."
+        )
+
+    verify_config = {
+        "verify_after_reading": True,
+        "verify_trust": True,
+        "verify_timestamp_trust": True,
+        "ocsp_fetch": False,
+        "remote_manifest_fetch": True
+    }
+
+    # --------------------------------------------------------
+    # Official C2PA context.
+    # IMPORTANT: internal test/policy anchors are NOT added here.
+    # This keeps official C2PA trust distinct from AI Act Shield Policy.
+    # --------------------------------------------------------
+    official_config = {
+        "trust": {
+            "trust_anchors": anchors
+        },
+        "verify": verify_config
+    }
+
+    try:
+        C2PA_CONTEXT = Context.from_dict(
+            official_config
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Impossibile inizializzare il Context C2PA ufficiale: "
+            f"{e}"
+        ) from e
+
+    # --------------------------------------------------------
+    # AI Act Shield internal policy context.
+    # It accepts the configured internal CA and/or the exact
+    # signing certificate used by the fixer.
+    # --------------------------------------------------------
+    policy_trust = {}
+
+    if user_anchors:
+        policy_trust["user_anchors"] = user_anchors
+
+    if signer_cert:
+        policy_trust["allowed_list"] = signer_cert
+
+    if policy_trust:
+        try:
+            C2PA_POLICY_CONTEXT = Context.from_dict({
+                "trust": policy_trust,
+                "verify": verify_config
+            })
+        except Exception as e:
+            raise RuntimeError(
+                "Impossibile inizializzare il Context "
+                "AI Act Shield Policy: "
+                f"{e}"
+            ) from e
+    else:
+        C2PA_POLICY_CONTEXT = None
+
+    C2PA_TRUST_SOURCE = source
+
+    log(
+        "C2PA context ufficiale inizializzato."
+    )
+
+    log(
+        "C2PA trust verification: ENABLED"
+    )
+
+    if C2PA_POLICY_CONTEXT is not None:
+        log(
+            "AI Act Shield Policy trust context: ENABLED"
+        )
+    else:
+        log(
+            "AI Act Shield Policy trust context: DISABLED"
+        )
+
+    log(
+        "C2PA trust source: "
+        f"{C2PA_TRUST_SOURCE}"
+    )'''
+
+          text = text[:start] + new_initialize + text[end:]
+
+          marker = '''    # C2PA manifest presente e senza
+    # failure di integrità.
+    result["valid"] = True
+
+    if result["trusted"]:'''
+
+          replacement = '''    # C2PA manifest presente e senza
+    # failure di integrità.
+    result["valid"] = True
+
+    # --------------------------------------------------------
+    # AI Act Shield internal policy fallback.
+    # First evaluate against the official C2PA trust context.
+    # Only a technically valid, officially-untrusted manifest
+    # is re-evaluated against the internal policy context.
+    # --------------------------------------------------------
+    if (
+        not result["trusted"]
+        and C2PA_POLICY_CONTEXT is not None
+    ):
+        try:
+            policy_stream = io.BytesIO(
+                file_bytes
+            )
+
+            policy_reader = c2pa.Reader(
+                mime_type,
+                policy_stream,
+                context=C2PA_POLICY_CONTEXT
+            )
+
+            policy_raw_json = policy_reader.json()
+
+            policy_parsed = json.loads(
+                policy_raw_json
+            ) if isinstance(
+                policy_raw_json,
+                str
+            ) else policy_raw_json
+
+            policy_validation_state = None
+            policy_validation_results = None
+
+            if isinstance(policy_parsed, dict):
+                policy_validation_state = (
+                    policy_parsed.get("validation_state")
+                    or
+                    policy_parsed.get("validationState")
+                )
+                policy_validation_results = (
+                    policy_parsed.get("validation_results")
+                    or
+                    policy_parsed.get("validationResults")
+                )
+
+            policy_codes = _collect_validation_codes(
+                policy_validation_results
+            )
+
+            policy_errors = _collect_validation_errors(
+                policy_validation_results
+            )
+
+            policy_trusted = bool(
+                (
+                    "signingCredential.trusted"
+                    in policy_codes
+                )
+                or
+                str(policy_validation_state).lower()
+                == "trusted"
+            ) and not policy_errors
+
+            if policy_trusted:
+                result["trusted"] = True
+                result["trust_source"] = (
+                    "ai_act_shield_policy"
+                )
+                result["status"] = (
+                    "trusted_internal"
+                )
+                return result
+
+        except Exception as policy_error:
+            log(
+                "AI Act Shield Policy verification skipped: "
+                f"{policy_error}"
+            )
+
+    if result["trusted"]:'''
+
+          if marker not in text:
+              raise SystemExit("Expected C2PA status marker not found.")
+
+          text = text.replace(marker, replacement, 1)
+
+          compile(text, "analyzer.py", "exec")
+          path.write_text(text, encoding="utf-8")
+          print("Internal policy recognition patch applied.")
+          print("analyzer.py syntax check: PASSED")
+          PY
+
+      - name: Commit repaired analyzer
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m "Fix AI Act Shield policy recognition for remediated files"
+          git push

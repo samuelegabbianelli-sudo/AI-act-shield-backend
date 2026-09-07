@@ -1,6 +1,9 @@
 name: Fix C2PA no-manifest detection
 
 on:
+  push:
+    paths:
+      - ".github/workflows/fix-c2pa-manifest-not-found.yml"
   workflow_dispatch:
 
 permissions:

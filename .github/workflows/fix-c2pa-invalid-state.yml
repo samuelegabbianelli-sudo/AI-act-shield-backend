@@ -1,0 +1,56 @@
+name: Fix C2PA invalid-state handling
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-c2pa-invalid-state.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch analyzer.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('analyzer.py')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''    has_real_errors = bool(\n        real_validation_errors\n    )\n\n    has_manifest = bool(\n        result["detected"]\n    )\n'''
+
+          new = '''    # C2PA can report a top-level Invalid validation state even when\n    # individual validation result entries do not expose success=False.\n    # Never allow the internal trust policy to override that state.\n    validation_state_invalid = (\n        str(validation_state).lower()\n        == "invalid"\n    )\n\n    has_real_errors = bool(\n        real_validation_errors\n        or validation_state_invalid\n    )\n\n    has_manifest = bool(\n        result["detected"]\n    )\n'''
+
+          if old not in text:
+              raise SystemExit('Expected C2PA validity block not found; no changes made.')
+
+          text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding='utf-8')
+          print('Patched analyzer.py: top-level C2PA Invalid now blocks internal trust.')
+          PY
+
+      - name: Verify patch
+        run: |
+          grep -n -A18 -B4 'validation_state_invalid' analyzer.py
+          python -m py_compile analyzer.py
+
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add analyzer.py
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No changes to commit.'
+            exit 0
+          fi
+          git commit -m 'Fix C2PA invalid state overriding internal trust'
+          git push

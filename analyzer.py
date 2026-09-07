@@ -1207,6 +1207,10 @@ def _collect_validation_codes(node):
 def _collect_validation_errors(node):
     errors = []
 
+    # C2PA validation_results contains both successful validation events
+    # and actual failures. Only explicit success=False entries are errors.
+    # Keep signingCredential.untrusted out of integrity failures because it
+    # means the signer is not trusted, not that the manifest is corrupted.
     for item in _flatten_validation_results(
         node
     ):
@@ -1218,7 +1222,10 @@ def _collect_validation_errors(node):
         if code == "signingCredential.untrusted":
             continue
 
-        errors.append(item)
+        success = item.get("success")
+
+        if success is False:
+            errors.append(item)
 
     return errors
 

@@ -1546,6 +1546,45 @@ def check_c2pa_metadata(
                 else policy_raw_json
             )
 
+            # Safe diagnostics: log only validation state/codes/trust booleans.
+            # Never log certificates, private keys, or raw manifest contents.
+            policy_codes = []
+            policy_trusted_values = []
+
+            def collect_policy_diagnostics(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        key_text = str(key).lower()
+                        if key_text == "code" and isinstance(item, str):
+                            policy_codes.append(item)
+                        if key_text in {
+                            "trusted",
+                            "signingcredential.trusted",
+                            "signing_credential.trusted",
+                        } and isinstance(item, bool):
+                            policy_trusted_values.append(item)
+                        collect_policy_diagnostics(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        collect_policy_diagnostics(item)
+
+            collect_policy_diagnostics(policy_data)
+
+            policy_state_for_log = ""
+            if isinstance(policy_data, dict):
+                policy_state_for_log = str(
+                    policy_data.get("validation_state")
+                    or policy_data.get("validationState")
+                    or ""
+                )
+
+            log(
+                "AI Act Shield Policy diagnostic: "
+                f"validation_state={policy_state_for_log!r}; "
+                f"trusted_values={policy_trusted_values!r}; "
+                f"codes={policy_codes!r}"
+            )
+
             def contains_trusted(value):
                 if isinstance(value, dict):
                     for key, item in value.items():

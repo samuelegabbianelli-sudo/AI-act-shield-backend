@@ -1325,19 +1325,31 @@ def check_c2pa_metadata(
         raw_json = reader.json()
 
     except Exception as e:
-        message = str(e)
+        message = str(e).strip()
+        error_name = message.split(":", 1)[0].strip()
 
-        # Nessun manifest C2PA rilevato:
-        # non deve diventare automaticamente
-        # un errore tecnico.
-        if (
-            "manifest" in message.lower()
-            or
-            "c2pa" in message.lower()
-        ):
-            result["status"] = (
-                "detected_unverified"
-            )
+        # C2PA Python reports the absence of a manifest as a specific
+        # ManifestNotFound error. A generic substring check for "manifest"
+        # or "c2pa" would incorrectly classify ordinary JPEG/PNG files as
+        # detected_unverified and could escalate them to manual review.
+        #
+        # Only classify a Reader exception as a C2PA-related unverified
+        # asset when the file itself contains strong C2PA/JUMBF markers.
+        has_c2pa_markers = (
+            b"c2pa" in file_bytes[:2 * 1024 * 1024].lower()
+            and
+            b"jumbf" in file_bytes[:2 * 1024 * 1024].lower()
+        )
+
+        log(
+            "C2PA Reader exception: "
+            f"error={error_name!r}; "
+            f"has_c2pa_markers={has_c2pa_markers}; "
+            f"message={message!r}"
+        )
+
+        if has_c2pa_markers and error_name != "ManifestNotFound":
+            result["status"] = "detected_unverified"
             result["detected"] = True
             result["validation_errors"] = [
                 {

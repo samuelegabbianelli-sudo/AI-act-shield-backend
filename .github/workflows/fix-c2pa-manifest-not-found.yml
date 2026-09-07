@@ -1,0 +1,49 @@
+name: Fix C2PA no-manifest detection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch analyzer
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("analyzer.py")
+          text = path.read_text(encoding="utf-8")
+
+          old = '''    except Exception as e:\n        message = str(e)\n\n        # Nessun manifest C2PA rilevato:\n        # non deve diventare automaticamente\n        # un errore tecnico.\n        if (\n            "manifest" in message.lower()\n            or\n            "c2pa" in message.lower()\n        ):\n            result["status"] = (\n                "detected_unverified"\n            )\n            result["detected"] = True\n            result["validation_errors"] = [\n                {\n                    "code": "reader.error",\n                    "message": message\n                }\n            ]\n\n        return result\n'''
+
+          new = '''    except Exception as e:\n        message = str(e).strip()\n        error_name = message.split(":", 1)[0].strip()\n\n        # C2PA Python reports the absence of a manifest as a specific\n        # ManifestNotFound error. A generic substring check for "manifest"\n        # or "c2pa" would incorrectly classify ordinary JPEG/PNG files as\n        # detected_unverified and could escalate them to manual review.\n        #\n        # Only classify a Reader exception as a C2PA-related unverified\n        # asset when the file itself contains strong C2PA/JUMBF markers.\n        has_c2pa_markers = (\n            b"c2pa" in file_bytes[:2 * 1024 * 1024].lower()\n            and\n            b"jumbf" in file_bytes[:2 * 1024 * 1024].lower()\n        )\n\n        log(\n            "C2PA Reader exception: "\n            f"error={error_name!r}; "\n            f"has_c2pa_markers={has_c2pa_markers}; "\n            f"message={message!r}"\n        )\n\n        if has_c2pa_markers and error_name != "ManifestNotFound":\n            result["status"] = "detected_unverified"\n            result["detected"] = True\n            result["validation_errors"] = [\n                {\n                    "code": "reader.error",\n                    "message": message\n                }\n            ]\n\n        return result\n'''
+
+          if old not in text:
+              raise SystemExit("Target C2PA Reader exception block not found; no changes made.")
+
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          print("C2PA no-manifest detection patch applied.")
+          PY
+
+      - name: Validate Python syntax
+        run: python -m py_compile analyzer.py
+
+      - name: Commit repaired analyzer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add analyzer.py
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Fix false C2PA detection for ordinary images"
+          git push

@@ -211,7 +211,7 @@ if old_status_block in text:
 elif 'result["status"] = "trusted_internal"' not in text:
     raise SystemExit("Expected C2PA trusted status block not found.")
 
-# 4. Add the diagnostic block to already-patched analyzer.py if it is not present.
+# 4. Add the policy diagnostic block to already-patched analyzer.py if it is not present.
 diagnostic_marker = '"AI Act Shield Policy diagnostic: "'
 if diagnostic_marker not in text:
     anchor = '''            policy_data = (
@@ -268,6 +268,40 @@ if diagnostic_marker not in text:
     if anchor not in text:
         raise SystemExit("Policy data anchor not found for diagnostics.")
     text = text.replace(anchor, diagnostic, 1)
+
+# 5. Add an EARLY C2PA diagnostic before the trust/validity gates.
+# This tells us why the internal-policy branch may be skipped.
+early_marker = '"AI Act Shield C2PA pre-policy diagnostic: "'
+if early_marker not in text:
+    anchor = '''    # --------------------------------------------------------
+    # IMPORTANT C2PA TRUST LOGIC
+    # --------------------------------------------------------
+'''
+    early_diagnostic = '''    # Safe diagnostic before any early return caused by validation errors.
+    # Never log certificates, private keys, or raw manifest contents.
+    pre_policy_codes = list(all_codes)
+    pre_policy_error_codes = [
+        item.get("code")
+        for item in validation_errors
+        if isinstance(item, dict) and isinstance(item.get("code"), str)
+    ]
+    pre_policy_state = str(validation_state or "")
+
+    log(
+        "AI Act Shield C2PA pre-policy diagnostic: "
+        f"validation_state={pre_policy_state!r}; "
+        f"codes={pre_policy_codes!r}; "
+        f"error_codes={pre_policy_error_codes!r}; "
+        f"policy_context_enabled={C2PA_POLICY_CONTEXT is not None}"
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT C2PA TRUST LOGIC
+    # --------------------------------------------------------
+'''
+    if anchor not in text:
+        raise SystemExit("C2PA trust logic anchor not found for early diagnostic.")
+    text = text.replace(anchor, early_diagnostic, 1)
 
 compile(text, "analyzer.py", "exec")
 path.write_text(text, encoding="utf-8")

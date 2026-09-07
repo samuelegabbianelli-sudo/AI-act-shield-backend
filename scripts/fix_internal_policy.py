@@ -127,6 +127,45 @@ new_status_block = '''    # Re-check technically valid, officially-untrusted man
                 else policy_raw_json
             )
 
+            # Safe diagnostics: log only validation state/codes/trust booleans.
+            # Never log certificates, private keys, or raw manifest contents.
+            policy_codes = []
+            policy_trusted_values = []
+
+            def collect_policy_diagnostics(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        key_text = str(key).lower()
+                        if key_text == "code" and isinstance(item, str):
+                            policy_codes.append(item)
+                        if key_text in {
+                            "trusted",
+                            "signingcredential.trusted",
+                            "signing_credential.trusted",
+                        } and isinstance(item, bool):
+                            policy_trusted_values.append(item)
+                        collect_policy_diagnostics(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        collect_policy_diagnostics(item)
+
+            collect_policy_diagnostics(policy_data)
+
+            policy_state_for_log = ""
+            if isinstance(policy_data, dict):
+                policy_state_for_log = str(
+                    policy_data.get("validation_state")
+                    or policy_data.get("validationState")
+                    or ""
+                )
+
+            log(
+                "AI Act Shield Policy diagnostic: "
+                f"validation_state={policy_state_for_log!r}; "
+                f"trusted_values={policy_trusted_values!r}; "
+                f"codes={policy_codes!r}"
+            )
+
             def contains_trusted(value):
                 if isinstance(value, dict):
                     for key, item in value.items():
@@ -172,7 +211,65 @@ if old_status_block in text:
 elif 'result["status"] = "trusted_internal"' not in text:
     raise SystemExit("Expected C2PA trusted status block not found.")
 
+# 4. Add the diagnostic block to already-patched analyzer.py if it is not present.
+diagnostic_marker = '"AI Act Shield Policy diagnostic: "'
+if diagnostic_marker not in text:
+    anchor = '''            policy_data = (
+                json.loads(policy_raw_json)
+                if isinstance(policy_raw_json, str)
+                else policy_raw_json
+            )
+'''
+    diagnostic = '''            policy_data = (
+                json.loads(policy_raw_json)
+                if isinstance(policy_raw_json, str)
+                else policy_raw_json
+            )
+
+            # Safe diagnostics: log only validation state/codes/trust booleans.
+            # Never log certificates, private keys, or raw manifest contents.
+            policy_codes = []
+            policy_trusted_values = []
+
+            def collect_policy_diagnostics(value):
+                if isinstance(value, dict):
+                    for key, item in value.items():
+                        key_text = str(key).lower()
+                        if key_text == "code" and isinstance(item, str):
+                            policy_codes.append(item)
+                        if key_text in {
+                            "trusted",
+                            "signingcredential.trusted",
+                            "signing_credential.trusted",
+                        } and isinstance(item, bool):
+                            policy_trusted_values.append(item)
+                        collect_policy_diagnostics(item)
+                elif isinstance(value, list):
+                    for item in value:
+                        collect_policy_diagnostics(item)
+
+            collect_policy_diagnostics(policy_data)
+
+            policy_state_for_log = ""
+            if isinstance(policy_data, dict):
+                policy_state_for_log = str(
+                    policy_data.get("validation_state")
+                    or policy_data.get("validationState")
+                    or ""
+                )
+
+            log(
+                "AI Act Shield Policy diagnostic: "
+                f"validation_state={policy_state_for_log!r}; "
+                f"trusted_values={policy_trusted_values!r}; "
+                f"codes={policy_codes!r}"
+            )
+'''
+    if anchor not in text:
+        raise SystemExit("Policy data anchor not found for diagnostics.")
+    text = text.replace(anchor, diagnostic, 1)
+
 compile(text, "analyzer.py", "exec")
 path.write_text(text, encoding="utf-8")
-print("Internal policy recognition patch applied.")
+print("Internal policy recognition patch/diagnostics applied.")
 print("analyzer.py syntax check: PASSED")

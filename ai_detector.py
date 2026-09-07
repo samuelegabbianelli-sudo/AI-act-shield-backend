@@ -46,11 +46,16 @@ def _get_credentials() -> tuple[str, str]:
 
 
 def detect_ai(
-    file_path: str,
+    file_bytes: bytes,
+    file_name: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Optional[float]:
     """
-    Analyze an image with Sightengine.
+    Analyze image bytes with Sightengine.
+
+    The analyzer pipeline already has the downloaded file in memory, so
+    do not treat those bytes as a filesystem path. Send them directly as
+    multipart form data to Sightengine.
 
     Returns:
         float: AI-generated probability in the range [0.0, 1.0]
@@ -61,17 +66,14 @@ def detect_ai(
     """
 
     logger.info("[AI DETECTOR] Starting Sightengine analysis")
-    logger.info("[AI DETECTOR] File: %s", file_path)
+    logger.info("[AI DETECTOR] File: %s", file_name)
 
-    if not file_path:
-        logger.warning("[AI DETECTOR] Empty file path")
+    if not file_bytes:
+        logger.warning("[AI DETECTOR] Empty file bytes")
         return None
 
-    if not os.path.isfile(file_path):
-        logger.warning(
-            "[AI DETECTOR] File does not exist: %s",
-            file_path,
-        )
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        logger.warning("[AI DETECTOR] Invalid file bytes type: %s", type(file_bytes))
         return None
 
     try:
@@ -84,28 +86,30 @@ def detect_ai(
         return None
 
     try:
-        with open(file_path, "rb") as image_file:
+        files = {
+            "media": (
+                file_name or "image",
+                bytes(file_bytes),
+                "application/octet-stream",
+            ),
+        }
 
-            files = {
-                "media": image_file,
-            }
+        data = {
+            "models": SIGHTENGINE_MODEL,
+            "api_user": api_user,
+            "api_secret": api_secret,
+        }
 
-            data = {
-                "models": SIGHTENGINE_MODEL,
-                "api_user": api_user,
-                "api_secret": api_secret,
-            }
+        logger.info(
+            "[AI DETECTOR] Sending image to Sightengine"
+        )
 
-            logger.info(
-                "[AI DETECTOR] Sending image to Sightengine"
-            )
-
-            response = requests.post(
-                SIGHTENGINE_URL,
-                files=files,
-                data=data,
-                timeout=timeout,
-            )
+        response = requests.post(
+            SIGHTENGINE_URL,
+            files=files,
+            data=data,
+            timeout=timeout,
+        )
 
         logger.info(
             "[AI DETECTOR] HTTP status: %s",
@@ -121,13 +125,6 @@ def detect_ai(
     except requests.RequestException as exc:
         logger.error(
             "[AI DETECTOR] Sightengine request failed: %s",
-            exc,
-        )
-        return None
-
-    except OSError as exc:
-        logger.error(
-            "[AI DETECTOR] Could not read image: %s",
             exc,
         )
         return None
@@ -166,7 +163,6 @@ def detect_ai(
     #       "ai_generated": 0.001
     #   }
     # }
-    #
     type_data = result.get("type", {})
 
     if not isinstance(type_data, dict):
@@ -209,35 +205,20 @@ def detect_ai(
 
 
 def analyze_image(
-    file_path: str,
+    file_bytes: bytes,
+    file_name: str,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Dict[str, Any]:
     """
-    Higher-level interface for analyzer.py.
+    Higher-level interface used by analyzer.py.
 
-    Returns a normalized result instead of only a float.
-
-    Example:
-
-    {
-        "available": True,
-        "provider": "sightengine",
-        "model": "genai",
-        "ai_score": 0.97
-    }
-
-    If Sightengine is unavailable:
-
-    {
-        "available": False,
-        "provider": "sightengine",
-        "model": "genai",
-        "ai_score": None
-    }
+    Accepts the already-downloaded image bytes instead of a filesystem path.
+    This matches the analyzer pipeline and avoids unnecessary temporary files.
     """
 
     score = detect_ai(
-        file_path=file_path,
+        file_bytes=file_bytes,
+        file_name=file_name,
         timeout=timeout,
     )
 
@@ -246,6 +227,8 @@ def analyze_image(
             "available": False,
             "provider": "sightengine",
             "model": SIGHTENGINE_MODEL,
+            "ai_generated": None,
+            "score": None,
             "ai_score": None,
         }
 
@@ -253,6 +236,8 @@ def analyze_image(
         "available": True,
         "provider": "sightengine",
         "model": SIGHTENGINE_MODEL,
+        "ai_generated": score,
+        "score": score,
         "ai_score": score,
     }
 
@@ -273,6 +258,12 @@ if __name__ == "__main__":
 
     image_path = sys.argv[1]
 
-    result = analyze_image(image_path)
+    with open(image_path, "rb") as image_file:
+        image_bytes = image_file.read()
+
+    result = analyze_image(
+        file_bytes=image_bytes,
+        file_name=os.path.basename(image_path),
+    )
 
     print(result)

@@ -1448,6 +1448,24 @@ def check_c2pa_metadata(
 
     result["issuer"] = issuer
 
+    # Safe diagnostic before any early return caused by validation errors.
+    # Never log certificates, private keys, or raw manifest contents.
+    pre_policy_codes = list(all_codes)
+    pre_policy_error_codes = [
+        item.get("code")
+        for item in validation_errors
+        if isinstance(item, dict) and isinstance(item.get("code"), str)
+    ]
+    pre_policy_state = str(validation_state or "")
+
+    log(
+        "AI Act Shield C2PA pre-policy diagnostic: "
+        f"validation_state={pre_policy_state!r}; "
+        f"codes={pre_policy_codes!r}; "
+        f"error_codes={pre_policy_error_codes!r}; "
+        f"policy_context_enabled={C2PA_POLICY_CONTEXT is not None}"
+    )
+
     # --------------------------------------------------------
     # IMPORTANT C2PA TRUST LOGIC
     # --------------------------------------------------------

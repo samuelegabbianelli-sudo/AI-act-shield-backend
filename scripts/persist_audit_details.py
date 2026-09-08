@@ -18,3 +18,4 @@ compile(text, "analyzer.py", "exec")
 path.write_text(text, encoding="utf-8")
 print("Persisted structured audit details.")
 print("analyzer.py syntax check: PASSED")
+# Trigger the one-time GitHub Actions patch workflow.
